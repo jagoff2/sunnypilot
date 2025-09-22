@@ -39,7 +39,7 @@ void HudRendererSP::updateState(const UIState &s) {
     speedLimitAheadValid = lmd.getSpeedLimitAheadValid();
     speedLimitAhead = lmd.getSpeedLimitAhead() * speedConv;
     speedLimitAheadDistance = lmd.getSpeedLimitAheadDistance();
-    if (speedLimitAheadDistance < speedLimitAheadDistancePrev && speedLimitAheadValidFrame < 2) {
+    if (speedLimitAheadDistance < speedLimitAheadDistancePrev && speedLimitAheadValidFrame < 5) {
       speedLimitAheadValidFrame++;
     } else if (speedLimitAheadDistance > speedLimitAheadDistancePrev && speedLimitAheadValidFrame > 0) {
       speedLimitAheadValidFrame--;
@@ -497,7 +497,7 @@ void HudRendererSP::drawUpcomingSpeedLimit(QPainter &p) {
 
   auto outputDistance = [&] {
     if (is_metric) {
-      if (speedLimitAheadDistance < 50) return tr("Near");
+      if (speedLimitAheadDistance < 100) return tr("Near");
       if (speedLimitAheadDistance >= 1000) return QString::number(speedLimitAheadDistance * METER_TO_KM, 'f', 1) + tr("km");
 
       int rounded = (speedLimitAheadDistance < 200) ? std::max(10, roundToInterval(speedLimitAheadDistance, 10, 5)) : roundToInterval(speedLimitAheadDistance, 100, 50);
