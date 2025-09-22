@@ -70,6 +70,7 @@ class LongitudinalPlannerSP:
       LongitudinalPlanSource.cruise: (v_cruise, a_ego),
       LongitudinalPlanSource.sccVision: (self.scc.vision.output_v_target, self.scc.vision.output_a_target),
       LongitudinalPlanSource.speedLimitAssist: (self.sla.output_v_target, self.sla.output_a_target),
+      LongitudinalPlanSource.sccMap: (self.scc.map.output_v_target, self.scc.map.output_a_target),
     }
 
     self.source = min(targets, key=lambda k: targets[k][0])
@@ -99,7 +100,7 @@ class LongitudinalPlannerSP:
 
     # Smart Cruise Control
     smartCruiseControl = longitudinalPlanSP.smartCruiseControl
-    # Vision Turn Speed Control
+    # Vision Control
     sccVision = smartCruiseControl.vision
     sccVision.state = self.scc.vision.state
     sccVision.vTarget = float(self.scc.vision.output_v_target)
@@ -108,6 +109,13 @@ class LongitudinalPlannerSP:
     sccVision.maxPredictedLateralAccel = float(self.scc.vision.max_pred_lat_acc)
     sccVision.enabled = self.scc.vision.is_enabled
     sccVision.active = self.scc.vision.is_active
+    # Map Control
+    sccMap = smartCruiseControl.map
+    sccMap.state = self.scc.map.state
+    sccMap.vTarget = float(self.scc.map.output_v_target)
+    sccMap.aTarget = float(self.scc.map.output_a_target)
+    sccMap.enabled = self.scc.map.is_enabled
+    sccMap.active = self.scc.map.is_active
 
     # Speed Limit
     speedLimit = longitudinalPlanSP.speedLimit
