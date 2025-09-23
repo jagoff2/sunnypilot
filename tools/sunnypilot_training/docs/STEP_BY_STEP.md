@@ -17,9 +17,12 @@ virtual machine.
    Import-Module .\env.psm1
    Enter-TrainingEnv
    ```
-   The script installs Python 3.7.9, PyTorch (CUDA wheels when `-InstallCUDA` is specified),
-   the CARLA 0.10.0 Python API, and all training dependencies into the repository `venv/`
-   directory. It also sets the `CARLA_ROOT` user environment variable for later commands.
+   The script installs Python 3.11.9, refreshes the repository `venv/` directory, pulls the
+   CARLA 0.10.0 Python API, and installs the full training dependency set. With `-InstallCUDA`
+   it inspects `nvidia-smi` to confirm the active GPU (logging the RTX 5060's SM 9.0 reading)
+   and automatically chooses the correct PyTorch wheel (CUDA 12.4 for SM ≥ 9, CUDA 12.1 for
+   earlier architectures). It also sets the `CARLA_ROOT` user environment variable for later
+   commands.
 4. **Verify GPU visibility**
    ```powershell
    python - <<'PY'

@@ -28,8 +28,11 @@ It targets Windows hosts and CARLA 0.10.0.
    Import-Module .\env.psm1
    Enter-TrainingEnv
    ```
-   The script defaults to Python 3.7.9 for CARLA 0.10.0 compatibility. Pass `-InstallCUDA` to
-   install CUDA-enabled PyTorch wheels when using an NVIDIA GPU.
+   The script installs Python 3.11.9, recreates the repository virtual environment, and
+   resolves every dependency needed for Windows 10 and 11 hosts. When `-InstallCUDA` is
+   specified it queries `nvidia-smi` to verify the detected GPU (including the RTX 5060's
+   SM 9.0 capability) and selects the matching PyTorch build (CUDA 12.4 for SM ≥ 9, CUDA 12.1
+   otherwise).
 
 2. **Launch CARLA**
    ```powershell

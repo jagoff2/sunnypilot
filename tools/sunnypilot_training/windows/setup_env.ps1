@@ -1,11 +1,13 @@
 Param(
-  [string]$PythonVersion = "3.7.9",
+  [string]$PythonVersion = "3.11.9",
   [switch]$InstallCUDA,
   [string]$CarlaVersion = "0.10.0",
   [string]$InstallDir = "$PSScriptRoot/../../.."
 )
 
 $ErrorActionPreference = "Stop"
+
+Set-StrictMode -Version Latest
 
 function Install-Python {
   param(
@@ -16,22 +18,161 @@ function Install-Python {
   Write-Host "Installing Python $Version"
   $pythonInstaller = "https://www.python.org/ftp/python/$Version/python-$Version-amd64.exe"
   $installerPath = Join-Path $env:TEMP "python-$Version.exe"
-  Invoke-WebRequest -Uri $pythonInstaller -OutFile $installerPath
+  Invoke-WebRequest -Uri $pythonInstaller -OutFile $installerPath -MaximumRedirection 5
   Start-Process -FilePath $installerPath -ArgumentList "/quiet InstallAllUsers=0 PrependPath=1 TargetDir=$Destination" -Wait
   Remove-Item $installerPath -ErrorAction SilentlyContinue
 }
 
+function Resolve-Python {
+  param(
+    [string]$Version
+  )
+
+  $desiredMajorMinor = ($Version -split '\.')[0..1] -join '.'
+  $targetDir = Join-Path $env:LOCALAPPDATA "Programs\Python\Python$($Version.Replace('.', ''))"
+
+  $existing = Get-Command python.exe -ErrorAction SilentlyContinue
+  if ($existing) {
+    $existingPath = $null
+    foreach ($property in 'Path', 'Source', 'Definition') {
+      if ($existing.PSObject.Properties.Match($property).Count -gt 0) {
+        $value = $existing.$property
+        if ($value) {
+          $existingPath = $value
+          break
+        }
+      }
+    }
+
+    if ($existingPath) {
+      $currentVersion = & $existingPath -c "import platform; print(platform.python_version())"
+    }
+    else {
+      $currentVersion = $null
+    }
+    if ($null -eq $currentVersion -or -not $currentVersion.StartsWith($desiredMajorMinor)) {
+      Install-Python -Version $Version -Destination $targetDir
+      return (Join-Path $targetDir "python.exe")
+    }
+    else {
+      Write-Host "Found Python $currentVersion on PATH"
+      return $existingPath
+    }
+  }
+
+  Install-Python -Version $Version -Destination $targetDir
+  return (Join-Path $targetDir "python.exe")
+}
+
 function Ensure-Venv {
   param(
-    [string]$PythonExe
+    [string]$PythonExe,
+    [string]$ExpectedVersion
   )
 
   $venvPath = Join-Path $PSScriptRoot "..\..\..\venv"
+  $venvPython = Join-Path $venvPath "Scripts\python.exe"
+  $expectedPrefix = ($ExpectedVersion -split '\.')[0..1] -join '.'
+
+  if (Test-Path $venvPython) {
+    $venvVersion = & $venvPython -c "import platform; print(platform.python_version())"
+    if (-not $venvVersion.StartsWith($expectedPrefix)) {
+      Write-Host "Existing virtual environment targets Python $venvVersion. Recreating for $ExpectedVersion."
+      Remove-Item $venvPath -Recurse -Force
+    }
+  }
+
   if (-Not (Test-Path $venvPath)) {
     Write-Host "Creating virtual environment at $venvPath"
     & $PythonExe -m venv $venvPath
   }
   return $venvPath
+}
+
+function Get-GpuInfo {
+  $smi = Get-Command "nvidia-smi.exe" -ErrorAction SilentlyContinue
+  if (-not $smi) {
+    return $null
+  }
+
+  try {
+    $name = (& $smi.Path --query-gpu=name --format=csv,noheader 2>$null | Select-Object -First 1).Trim()
+    $cap = (& $smi.Path --query-gpu=compute_cap --format=csv,noheader 2>$null | Select-Object -First 1).Trim()
+  }
+  catch {
+    return $null
+  }
+
+  if (-not $cap) {
+    return $null
+  }
+
+  $culture = [System.Globalization.CultureInfo]::InvariantCulture
+  $capability = 0.0
+  if ([double]::TryParse($cap, [System.Globalization.NumberStyles]::Float, $culture, [ref]$capability)) {
+    return [PSCustomObject]@{
+      Name = $name
+      ComputeCapability = $capability
+    }
+  }
+
+  return $null
+}
+
+function Install-TorchPackages {
+  param(
+    [string]$PythonExe,
+    [switch]$UseCUDA
+  )
+
+  $pipArgs = @('-m', 'pip', 'install', '--no-cache-dir')
+  $culture = [System.Globalization.CultureInfo]::InvariantCulture
+
+  if ($UseCUDA) {
+    $gpuInfo = Get-GpuInfo
+    $capability = $null
+    if ($gpuInfo) {
+      $capability = $gpuInfo.ComputeCapability
+      $formattedCapability = $capability.ToString('0.0', $culture)
+      Write-Host "Detected GPU: $($gpuInfo.Name) (compute capability $formattedCapability)"
+      if ($gpuInfo.Name -match '5060') {
+        Write-Host "Verified RTX 5060 compute capability $formattedCapability"
+      }
+    }
+    else {
+      Write-Warning "Unable to query NVIDIA GPU details. Proceeding with CUDA-enabled PyTorch installation."
+    }
+
+    if ($capability -and $capability -lt 9.0) {
+      $torchArgs = @(
+        'torch==2.4.1+cu121',
+        'torchvision==0.19.1+cu121',
+        'torchaudio==2.4.1',
+        '--index-url', 'https://download.pytorch.org/whl/cu121'
+      )
+      Write-Host "Installing PyTorch 2.4.1 with CUDA 12.1 support"
+    }
+    else {
+      $torchArgs = @(
+        'torch==2.5.1+cu124',
+        'torchvision==0.20.1+cu124',
+        'torchaudio==2.5.1',
+        '--index-url', 'https://download.pytorch.org/whl/cu124'
+      )
+      Write-Host "Installing PyTorch 2.5.1 with CUDA 12.4 support"
+    }
+
+    & $PythonExe @($pipArgs + $torchArgs)
+  }
+  else {
+    $torchArgs = @(
+      'torch==2.5.1',
+      'torchvision==0.20.1',
+      'torchaudio==2.5.1'
+    )
+    Write-Host "Installing CPU PyTorch 2.5.1"
+    & $PythonExe @($pipArgs + $torchArgs)
+  }
 }
 
 function Install-PythonPackages {
@@ -40,20 +181,15 @@ function Install-PythonPackages {
     [switch]$UseCUDA
   )
 
-  $pip = Join-Path $VenvPath "Scripts\pip.exe"
-  & $pip install --upgrade pip
+  $python = Join-Path $VenvPath "Scripts\python.exe"
+  $env:PIP_NO_CACHE_DIR = '1'
+  & $python -m pip install --upgrade pip
+  & $python -m pip install --upgrade setuptools wheel
 
-  if ($UseCUDA) {
-    Write-Host "Installing CUDA-enabled PyTorch 1.12.1 (cu113)"
-    $torchIndex = "https://download.pytorch.org/whl/cu113"
-    & $pip install torch==1.12.1+cu113 torchvision==0.13.1+cu113 torchaudio==0.12.1 --extra-index-url $torchIndex
-  }
-  else {
-    Write-Host "Installing CPU PyTorch 1.12.1"
-    & $pip install torch==1.12.1 torchvision==0.13.1 torchaudio==0.12.1
-  }
+  Install-TorchPackages -PythonExe $python -UseCUDA:$UseCUDA
 
-  & $pip install hydra-core==1.3.2 omegaconf==2.3.0 tinygrad==0.8.0 zarr numpy scipy tqdm pygame pytest
+  & $python -m pip install --no-cache-dir hydra-core==1.3.2 omegaconf==2.3.0 tinygrad==0.8.0 zarr numpy scipy tqdm pygame pytest
+  Remove-Item Env:PIP_NO_CACHE_DIR -ErrorAction SilentlyContinue
 }
 
 function Install-CARLA {
@@ -62,10 +198,11 @@ function Install-CARLA {
     [string]$Destination
   )
 
-  $carlaZip = "https://carla-releases.s3.eu-west-3.amazonaws.com/Windows/CARLA_$Version.zip"
+  $token = $Version.Replace('.', '-')
+  $carlaZip = "https://tiny.carla.org/carla-$token-windows"
   $downloadPath = Join-Path $env:TEMP "CARLA_$Version.zip"
   Write-Host "Downloading CARLA $Version"
-  Invoke-WebRequest -Uri $carlaZip -OutFile $downloadPath
+  Invoke-WebRequest -Uri $carlaZip -OutFile $downloadPath -MaximumRedirection 5
   Write-Host "Extracting CARLA archive to $Destination"
   if (-Not (Test-Path $Destination)) {
     New-Item -ItemType Directory -Path $Destination | Out-Null
@@ -92,9 +229,9 @@ function Install-CarlaPythonModule {
     throw "Unable to locate CARLA wheel/egg in $distDir"
   }
 
-  $pip = Join-Path $VenvPath "Scripts\pip.exe"
+  $python = Join-Path $VenvPath "Scripts\python.exe"
   Write-Host "Installing CARLA Python package from $($package.Name)"
-  & $pip install $package.FullName
+  & $python -m pip install --no-cache-dir $package.FullName
 
   $additionalPaths = @(
     (Join-Path $pythonApi "carla\lib"),
@@ -120,14 +257,9 @@ function Configure-CarlaEnvironment {
   Write-Host "CARLA_ROOT set to $carlaRoot"
 }
 
-$pythonPath = (Get-Command python.exe -ErrorAction SilentlyContinue).Path
-if (-Not $pythonPath) {
-  $targetDir = Join-Path $env:LOCALAPPDATA "Programs\Python\Python$($PythonVersion.Replace('.', ''))"
-  Install-Python -Version $PythonVersion -Destination $targetDir
-  $pythonPath = Join-Path $targetDir "python.exe"
-}
+$pythonPath = Resolve-Python -Version $PythonVersion
 
-$venv = Ensure-Venv -PythonExe $pythonPath
+$venv = Ensure-Venv -PythonExe $pythonPath -ExpectedVersion $PythonVersion
 Install-PythonPackages -VenvPath $venv -UseCUDA:$InstallCUDA
 
 $resolvedInstallDir = [System.IO.Path]::GetFullPath($InstallDir)
