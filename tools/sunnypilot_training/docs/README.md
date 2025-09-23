@@ -19,7 +19,39 @@ It targets Windows hosts and CARLA 0.10.0.
 - **Windows tooling** (`windows/`): PowerShell scripts to bootstrap Python, CARLA, and provide
   helper commands for daily workflows.
 
+## Automated pipeline
+
+After running `setup_env.ps1` and activating the virtual environment, the Windows automation
+script can execute the entire workflow:
+
+```powershell
+cd tools\sunnypilot_training\windows
+Import-Module .\env.psm1
+Enter-TrainingEnv
+# Collect 50/10 episodes, train with the default Hydra config, and export to .\artifacts
+.\run_full_training.ps1 `
+  -Scenario urban_intersection `
+  -TrainEpisodes 50 `
+  -ValEpisodes 10 `
+  -OutputDir ..\artifacts
+```
+
+`run_full_training.ps1` launches CARLA off-screen, verifies connectivity, records the requested
+episodes, trains the diffusion vision and policy models, and exports ONNX/tinygrad/metadata blobs.
+The script surfaces failures with actionable error messages (for example when CARLA fails to
+start or the dataset is incomplete) and prints the absolute paths to all exported artifacts on
+success. Useful switches include:
+
+- `-ExportDir <path>` — write ONNX/tinygrad/metadata files to a custom directory.
+- `-CheckpointPath <file>` — export an existing checkpoint without retraining.
+- `-SkipDataCollection`, `-SkipTraining`, or `-SkipExport` — reuse previously completed steps.
+- `-InstallModels` — copy the exported artifacts into `selfdrive/modeld/models` via
+  `integration/replace_models.ps1`.
+- `-KeepCarlaRunning` — leave the CARLA process alive after data collection for manual work.
+
 ## Quick start
+
+The manual commands below remain available when you need per-step control:
 
 1. **Bootstrap the environment**
    ```powershell

@@ -4,6 +4,33 @@ This walkthrough assumes a Windows 10/11 workstation with a recent NVIDIA driver
 PowerShell 5.1 or later. The same steps work on bare metal or inside a GPU-enabled
 virtual machine.
 
+## 0. Automate the entire pipeline (optional)
+
+If you prefer a single command that handles data collection, training, export, and optional
+model installation, run the Windows automation script after completing `setup_env.ps1`:
+
+```powershell
+cd tools\sunnypilot_training\windows
+Import-Module .\env.psm1
+Enter-TrainingEnv
+.\run_full_training.ps1 -Scenario urban_intersection -TrainEpisodes 50 -ValEpisodes 10 -OutputDir ..\artifacts
+```
+
+The script launches CARLA in off-screen mode, waits for a healthy connection, records the
+requested episodes into `tools\sunnypilot_training\data\zarr`, trains using the selected Hydra
+configuration, and exports ONNX/tinygrad/metadata artifacts into the specified output directory.
+Key parameters include:
+
+- `-ExportDir <path>` — choose where the final ONNX/tinygrad/metadata files are written.
+- `-CheckpointPath <file>` — export from an existing checkpoint instead of retraining.
+- `-SkipDataCollection`, `-SkipTraining`, `-SkipExport` — reuse existing artifacts when iterating.
+- `-InstallModels` — copy the exports into `selfdrive/modeld/models` via
+  `integration/replace_models.ps1`.
+- `-KeepCarlaRunning` — prevent the script from shutting down CARLA after data collection.
+
+The remaining sections describe the manual steps if you want granular control or need to
+understand each component in detail.
+
 ## 1. Prepare the environment
 
 1. **Open PowerShell as Administrator** (needed the first time to install dependencies).
