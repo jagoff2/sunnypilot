@@ -207,33 +207,136 @@ function Install-PythonPackages {
   Remove-Item Env:PIP_NO_CACHE_DIR -ErrorAction SilentlyContinue
 }
 
+function Resolve-CarlaInstallPath {
+  param(
+    [string]$InstallRoot,
+    [string]$Version
+  )
+
+  if (-not (Test-Path $InstallRoot)) {
+    return $null
+  }
+
+  $versions = @($Version, $Version.Replace('.', '_'))
+  $candidateNames = @()
+
+  foreach ($variant in $versions) {
+    $candidateNames += @(
+      "CARLA_$variant",
+      "CARLA-$variant",
+      "CARLA-$variant-Win64-Shipping",
+      "CARLA_$variant-Win64-Shipping",
+      "Carla-$variant",
+      "Carla-$variant-Win64-Shipping",
+      "Carla_$variant",
+      "Carla_$variant-Win64-Shipping"
+    )
+  }
+
+  $candidateNames = $candidateNames | Select-Object -Unique
+
+  foreach ($name in $candidateNames) {
+    $candidatePath = Join-Path $InstallRoot $name
+    if (Test-Path $candidatePath) {
+      $distDir = Join-Path $candidatePath "PythonAPI\carla\dist"
+      if (Test-Path $distDir) {
+        return $candidatePath
+      }
+    }
+  }
+
+  $directories = Get-ChildItem -Path $InstallRoot -Directory -ErrorAction SilentlyContinue
+  foreach ($dir in $directories) {
+    foreach ($versionString in $versions) {
+      if ($dir.Name -like "*$versionString*") {
+        $distDir = Join-Path $dir.FullName "PythonAPI\carla\dist"
+        if (Test-Path $distDir) {
+          return $dir.FullName
+        }
+      }
+    }
+  }
+
+  return $null
+}
+
 function Install-CARLA {
   param(
     [string]$Version,
     [string]$Destination
   )
 
+  $targetDir = Join-Path $Destination "CARLA_$Version"
+  $targetFullPath = [System.IO.Path]::GetFullPath($targetDir)
+
+  $existing = Resolve-CarlaInstallPath -InstallRoot $Destination -Version $Version
+  if ($existing) {
+    $existingFullPath = [System.IO.Path]::GetFullPath($existing)
+    if ($existingFullPath -ieq $targetFullPath) {
+      Write-Host "CARLA $Version already installed at $targetDir"
+      return $targetDir
+    }
+
+    Write-Host "Found existing CARLA $Version installation at $existing. Normalizing to $targetDir"
+    if (Test-Path $targetDir) {
+      Remove-Item $targetDir -Recurse -Force
+    }
+    Move-Item -Path $existing -Destination $targetDir
+    return $targetDir
+  }
+
   $token = $Version.Replace('.', '-')
   $carlaZip = "https://tiny.carla.org/carla-$token-windows"
   $downloadPath = Join-Path $env:TEMP "CARLA_$Version.zip"
-  Write-Host "Downloading CARLA $Version"
-  Invoke-WebRequest -Uri $carlaZip -OutFile $downloadPath -MaximumRedirection 5
+  if (Test-Path $downloadPath) {
+    Write-Host "Using existing CARLA $Version archive at $downloadPath"
+  }
+  else {
+    Write-Host "Downloading CARLA $Version"
+    Invoke-WebRequest -Uri $carlaZip -OutFile $downloadPath -MaximumRedirection 5
+  }
+
   Write-Host "Extracting CARLA archive to $Destination"
   if (-Not (Test-Path $Destination)) {
     New-Item -ItemType Directory -Path $Destination | Out-Null
   }
   Expand-Archive -Path $downloadPath -DestinationPath $Destination -Force
   Remove-Item $downloadPath -ErrorAction SilentlyContinue
+
+  $extracted = Resolve-CarlaInstallPath -InstallRoot $Destination -Version $Version
+  if (-not $extracted) {
+    throw "CARLA Python API distribution not found after extracting archive to $Destination"
+  }
+
+  $extractedFullPath = [System.IO.Path]::GetFullPath($extracted)
+  if ($extractedFullPath -ieq $targetFullPath) {
+    return $targetDir
+  }
+
+  if (Test-Path $targetDir) {
+    Remove-Item $targetDir -Recurse -Force
+  }
+
+  Move-Item -Path $extracted -Destination $targetDir
+  return $targetDir
 }
 
 function Install-CarlaPythonModule {
   param(
     [string]$VenvPath,
     [string]$InstallRoot,
-    [string]$Version
+    [string]$Version,
+    [string]$CarlaRoot = $null
   )
 
-  $pythonApi = Join-Path $InstallRoot "CARLA_$Version\PythonAPI"
+  if (-not $CarlaRoot) {
+    $CarlaRoot = Resolve-CarlaInstallPath -InstallRoot $InstallRoot -Version $Version
+  }
+  if (-not $CarlaRoot) {
+    throw "CARLA Python API distribution not found for version $Version under $InstallRoot"
+  }
+
+  $pythonApi = Join-Path $CarlaRoot "PythonAPI"
   $distDir = Join-Path $pythonApi "carla\dist"
   if (-Not (Test-Path $distDir)) {
     throw "CARLA Python API distribution not found at $distDir"
@@ -263,13 +366,19 @@ function Install-CarlaPythonModule {
 function Configure-CarlaEnvironment {
   param(
     [string]$InstallRoot,
-    [string]$Version
+    [string]$Version,
+    [string]$CarlaRoot = $null
   )
 
-  $carlaRoot = Join-Path $InstallRoot "CARLA_$Version"
-  $carlaRoot = [System.IO.Path]::GetFullPath($carlaRoot)
-  [Environment]::SetEnvironmentVariable("CARLA_ROOT", $carlaRoot, "User")
-  Write-Host "CARLA_ROOT set to $carlaRoot"
+  if (-not $CarlaRoot) {
+    $CarlaRoot = Resolve-CarlaInstallPath -InstallRoot $InstallRoot -Version $Version
+  }
+  if (-not $CarlaRoot) {
+    throw "CARLA installation for version $Version not found under $InstallRoot"
+  }
+  $resolvedCarlaRoot = [System.IO.Path]::GetFullPath($CarlaRoot)
+  [Environment]::SetEnvironmentVariable("CARLA_ROOT", $resolvedCarlaRoot, "User")
+  Write-Host "CARLA_ROOT set to $resolvedCarlaRoot"
 }
 
 $pythonPath = Resolve-Python -Version $PythonVersion
@@ -278,12 +387,12 @@ $venv = Ensure-Venv -PythonExe $pythonPath -ExpectedVersion $PythonVersion
 Install-PythonPackages -VenvPath $venv -UseCUDA:$InstallCUDA
 
 $resolvedInstallDir = [System.IO.Path]::GetFullPath($InstallDir)
-$carlaInstallPath = Join-Path $resolvedInstallDir "CARLA_$CarlaVersion"
-if (-Not (Test-Path $carlaInstallPath)) {
-  Install-CARLA -Version $CarlaVersion -Destination $resolvedInstallDir
+$carlaRoot = Install-CARLA -Version $CarlaVersion -Destination $resolvedInstallDir
+if (-not $carlaRoot) {
+  throw "Failed to locate CARLA installation for version $CarlaVersion"
 }
 
-Install-CarlaPythonModule -VenvPath $venv -InstallRoot $resolvedInstallDir -Version $CarlaVersion
-Configure-CarlaEnvironment -InstallRoot $resolvedInstallDir -Version $CarlaVersion
+Install-CarlaPythonModule -VenvPath $venv -InstallRoot $resolvedInstallDir -Version $CarlaVersion -CarlaRoot $carlaRoot
+Configure-CarlaEnvironment -InstallRoot $resolvedInstallDir -Version $CarlaVersion -CarlaRoot $carlaRoot
 
 Write-Host "Environment setup complete. Activate with:`n`""$venv\Scripts\Activate.ps1""`
