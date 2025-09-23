@@ -98,19 +98,33 @@ function Start-CarlaProcess {
     [int]$Port,
     [string]$RepoRoot
   )
-  $existing = Get-Process -Name CarlaUE4 -ErrorAction SilentlyContinue
+  $processNames = @("CarlaUnreal", "CarlaUE4")
+  $existing = foreach ($name in $processNames) {
+    Get-Process -Name $name -ErrorAction SilentlyContinue
+  }
+  $existing = $existing | Where-Object { $_ }
   if ($existing) {
+    $names = ($existing | Select-Object -ExpandProperty ProcessName -Unique) -join ', '
     $pids = ($existing | Select-Object -ExpandProperty Id) -join ', '
-    throw "Detected an existing CarlaUE4 process (PID: $pids). Stop it before running the automated pipeline."
+    throw "Detected an existing CARLA process ($names) with PID(s): $pids. Stop it before running the automated pipeline."
   }
   $carlaRoot = [Environment]::GetEnvironmentVariable("CARLA_ROOT", "User")
   if (-not $carlaRoot) {
     $carlaRoot = Join-Path $RepoRoot "CARLA_0.10.0"
   }
   $carlaRoot = [System.IO.Path]::GetFullPath($carlaRoot)
-  $carlaExe = Join-Path $carlaRoot "CarlaUE4.exe"
-  if (-not (Test-Path $carlaExe)) {
-    throw "CARLA executable not found at $carlaExe. Re-run setup_env.ps1 with the default CARLA installation."
+  $carlaExe = $null
+  foreach ($exeName in @("CarlaUnreal.exe", "CarlaUE4.exe")) {
+    $candidate = Join-Path $carlaRoot $exeName
+    if (Test-Path $candidate) {
+      $carlaExe = $candidate
+      break
+    }
+  }
+  if (-not $carlaExe) {
+    $expectedPaths = @("CarlaUnreal.exe", "CarlaUE4.exe") | ForEach-Object { Join-Path $carlaRoot $_ }
+    $expectedList = ($expectedPaths) -join ', '
+    throw "CARLA executable not found. Expected one of: $expectedList. Re-run setup_env.ps1 with the default CARLA installation."
   }
   $arguments = @("-RenderOffScreen", "-quality-level=Epic", "-ResX=1920", "-ResY=1080", "-world-port=$Port")
   $process = Start-Process -FilePath $carlaExe -ArgumentList $arguments -PassThru -WorkingDirectory $carlaRoot -WindowStyle Hidden
@@ -121,7 +135,7 @@ function Start-CarlaProcess {
 function Test-CarlaReady {
   param(
     [string]$PythonExe,
-    [string]$Host,
+    [string]$CarlaHost,
     [int]$Port
   )
   $scriptTemplate = @'
@@ -136,7 +150,7 @@ except Exception:
 else:
   sys.exit(0)
 '@
-  $script = [string]::Format($scriptTemplate, $Host, $Port)
+  $script = [string]::Format($scriptTemplate, $CarlaHost, $Port)
   $process = Start-Process -FilePath $PythonExe -ArgumentList "-c", $script -NoNewWindow -PassThru -Wait
   return $process.ExitCode -eq 0
 }
@@ -144,19 +158,19 @@ else:
 function Wait-CarlaReady {
   param(
     [string]$PythonExe,
-    [string]$Host,
+    [string]$CarlaHost,
     [int]$Port,
     [int]$Timeout
   )
   $deadline = (Get-Date).AddSeconds($Timeout)
   while ((Get-Date) -lt $deadline) {
-    if (Test-CarlaReady -PythonExe $PythonExe -Host $Host -Port $Port) {
-      Write-Host "CARLA is ready on ${Host}:${Port}"
+    if (Test-CarlaReady -PythonExe $PythonExe -CarlaHost $CarlaHost -Port $Port) {
+      Write-Host "CARLA is ready on ${CarlaHost}:${Port}"
       return
     }
     Start-Sleep -Seconds 2
   }
-  throw "Timed out waiting for CARLA to respond on ${Host}:${Port} after $Timeout seconds."
+  throw "Timed out waiting for CARLA to respond on ${CarlaHost}:${Port} after $Timeout seconds."
 }
 
 function Ensure-ShardsPresent {
@@ -245,7 +259,7 @@ Push-Location $repoRoot
 try {
   if (-not $SkipDataCollection) {
     $carlaProcess = Start-CarlaProcess -Port $CarlaPort -RepoRoot $repoRoot
-    Wait-CarlaReady -PythonExe $pythonExe -Host $CarlaHost -Port $CarlaPort -Timeout $CarlaReadyTimeout
+    Wait-CarlaReady -PythonExe $pythonExe -CarlaHost $CarlaHost -Port $CarlaPort -Timeout $CarlaReadyTimeout
 
     if ($TrainEpisodes -gt 0) {
       $trainCollectorArgs = @(
