@@ -77,6 +77,22 @@ function Invoke-PythonCommand {
   }
 }
 
+function Invoke-PythonModule {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Description,
+    [Parameter(Mandatory = $true)]
+    [string]$Module,
+    [string[]]$Arguments = @(),
+    [string]$PythonExe
+  )
+  $moduleArgs = @("-m", $Module)
+  if ($Arguments) {
+    $moduleArgs += $Arguments
+  }
+  Invoke-PythonCommand -Description $Description -Arguments $moduleArgs -PythonExe $PythonExe
+}
+
 function Start-CarlaProcess {
   param(
     [int]$Port,
@@ -135,12 +151,12 @@ function Wait-CarlaReady {
   $deadline = (Get-Date).AddSeconds($Timeout)
   while ((Get-Date) -lt $deadline) {
     if (Test-CarlaReady -PythonExe $PythonExe -Host $Host -Port $Port) {
-      Write-Host "CARLA is ready on $Host:$Port"
+      Write-Host "CARLA is ready on ${Host}:${Port}"
       return
     }
     Start-Sleep -Seconds 2
   }
-  throw "Timed out waiting for CARLA to respond on $Host:$Port after $Timeout seconds."
+  throw "Timed out waiting for CARLA to respond on ${Host}:${Port} after $Timeout seconds."
 }
 
 function Ensure-ShardsPresent {
@@ -179,14 +195,25 @@ function Get-LatestCheckpointPath {
 $pythonExe = Resolve-PythonExe
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "../../.."))
 $toolsRoot = Join-Path $repoRoot "tools/sunnypilot_training"
-$collectorScript = Join-Path $toolsRoot "collector/collect_data.py"
-$trainScript = Join-Path $toolsRoot "training/train.py"
-$visionExportScript = Join-Path $toolsRoot "export/export_vision.py"
-$policyExportScript = Join-Path $toolsRoot "export/export_policy.py"
+$collectorModule = "tools.sunnypilot_training.collector.collect_data"
+$trainModule = "tools.sunnypilot_training.training.train"
+$visionExportModule = "tools.sunnypilot_training.export.export_vision"
+$policyExportModule = "tools.sunnypilot_training.export.export_policy"
 $integrationScript = Join-Path $toolsRoot "integration/replace_models.ps1"
 
 if (-not (Test-Path $toolsRoot)) {
   throw "Unable to locate sunnypilot training tools at $toolsRoot"
+}
+
+$pathSeparator = [System.IO.Path]::PathSeparator
+if ($env:PYTHONPATH) {
+  $paths = $env:PYTHONPATH -split [System.Text.RegularExpressions.Regex]::Escape($pathSeparator)
+  if ($paths -notcontains $repoRoot) {
+    $env:PYTHONPATH = "$repoRoot$pathSeparator$env:PYTHONPATH"
+  }
+}
+else {
+  $env:PYTHONPATH = $repoRoot
 }
 
 $datasetRootFull = [System.IO.Path]::GetFullPath($DatasetRoot)
@@ -214,15 +241,14 @@ Ensure-Directory $exportRoot
 
 $carlaProcess = $null
 $originalLocation = Get-Location
-Push-Location $toolsRoot
+Push-Location $repoRoot
 try {
   if (-not $SkipDataCollection) {
     $carlaProcess = Start-CarlaProcess -Port $CarlaPort -RepoRoot $repoRoot
     Wait-CarlaReady -PythonExe $pythonExe -Host $CarlaHost -Port $CarlaPort -Timeout $CarlaReadyTimeout
 
     if ($TrainEpisodes -gt 0) {
-      $trainArgs = @(
-        $collectorScript,
+      $trainCollectorArgs = @(
         "--host", $CarlaHost,
         "--port", $CarlaPort.ToString(),
         "--scenario", $Scenario,
@@ -231,9 +257,9 @@ try {
         "--shard-size", $TrainShardSize.ToString()
       )
       if ($PSBoundParameters.ContainsKey('CollectorSeed')) {
-        $trainArgs += @("--seed", $CollectorSeed.ToString())
+        $trainCollectorArgs += @("--seed", $CollectorSeed.ToString())
       }
-      Invoke-PythonCommand -Description "collect $TrainEpisodes training episodes" -Arguments $trainArgs -PythonExe $pythonExe
+      Invoke-PythonModule -Description "collect $TrainEpisodes training episodes" -Module $collectorModule -Arguments $trainCollectorArgs -PythonExe $pythonExe
       Ensure-ShardsPresent -Directory $trainDir -Label "training" -ExpectedEpisodes $TrainEpisodes
     }
     else {
@@ -241,8 +267,7 @@ try {
     }
 
     if ($ValEpisodes -gt 0) {
-      $valArgs = @(
-        $collectorScript,
+      $valCollectorArgs = @(
         "--host", $CarlaHost,
         "--port", $CarlaPort.ToString(),
         "--scenario", $Scenario,
@@ -251,9 +276,9 @@ try {
         "--shard-size", $ValShardSize.ToString()
       )
       if ($PSBoundParameters.ContainsKey('CollectorSeed')) {
-        $valArgs += @("--seed", ($CollectorSeed + 1).ToString())
+        $valCollectorArgs += @("--seed", ($CollectorSeed + 1).ToString())
       }
-      Invoke-PythonCommand -Description "collect $ValEpisodes validation episodes" -Arguments $valArgs -PythonExe $pythonExe
+      Invoke-PythonModule -Description "collect $ValEpisodes validation episodes" -Module $collectorModule -Arguments $valCollectorArgs -PythonExe $pythonExe
       Ensure-ShardsPresent -Directory $valDir -Label "validation" -ExpectedEpisodes $ValEpisodes
     }
     else {
@@ -300,10 +325,9 @@ try {
       $overrides += $ConfigOverride
     }
     $trainArgs = @(
-      $trainScript,
       "--config-name", $ConfigName
     ) + $overrides
-    Invoke-PythonCommand -Description "train diffusion models" -Arguments $trainArgs -PythonExe $pythonExe
+    Invoke-PythonModule -Description "train diffusion models" -Module $trainModule -Arguments $trainArgs -PythonExe $pythonExe
   }
   else {
     Write-Host "Skipping training as requested."
@@ -331,22 +355,20 @@ try {
 
   if (-not $SkipExport) {
     $visionArgs = @(
-      $visionExportScript,
       $checkpointToExport,
       "--onnx", $visionOnnx,
       "--tinygrad", $visionTinygrad,
       "--metadata", $visionMetadata
     )
-    Invoke-PythonCommand -Description "export vision model" -Arguments $visionArgs -PythonExe $pythonExe
+    Invoke-PythonModule -Description "export vision model" -Module $visionExportModule -Arguments $visionArgs -PythonExe $pythonExe
 
     $policyArgs = @(
-      $policyExportScript,
       $checkpointToExport,
       "--onnx", $policyOnnx,
       "--tinygrad", $policyTinygrad,
       "--metadata", $policyMetadata
     )
-    Invoke-PythonCommand -Description "export policy model" -Arguments $policyArgs -PythonExe $pythonExe
+    Invoke-PythonModule -Description "export policy model" -Module $policyExportModule -Arguments $policyArgs -PythonExe $pythonExe
   }
   else {
     Write-Host "Skipping export as requested."
