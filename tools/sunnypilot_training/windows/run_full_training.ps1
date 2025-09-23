@@ -150,9 +150,21 @@ except Exception:
 else:
   sys.exit(0)
 '@
-  $script = [string]::Format($scriptTemplate, $CarlaHost, $Port)
-  $process = Start-Process -FilePath $PythonExe -ArgumentList "-c", $script -NoNewWindow -PassThru -Wait
-  return $process.ExitCode -eq 0
+  $scriptContent = [string]::Format($scriptTemplate, $CarlaHost, $Port)
+  $tempScriptPath = [System.IO.Path]::ChangeExtension(
+    [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [System.IO.Path]::GetRandomFileName()),
+    ".py"
+  )
+  try {
+    [System.IO.File]::WriteAllText($tempScriptPath, $scriptContent)
+    $process = Start-Process -FilePath $PythonExe -ArgumentList $tempScriptPath -NoNewWindow -PassThru -Wait
+    return $process.ExitCode -eq 0
+  }
+  finally {
+    if (Test-Path $tempScriptPath) {
+      Remove-Item -Path $tempScriptPath -Force
+    }
+  }
 }
 
 function Wait-CarlaReady {
