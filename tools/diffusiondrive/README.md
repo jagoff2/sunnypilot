@@ -94,22 +94,44 @@ PowerShell terminal:
    setx DIFFUSIONDRIVE_WEIGHTS "C:\DiffusionDrive\weights"
    ```
 
-## Running the sample server
+## Running the inference server
 
-The included `diffusiondrive_server.py` is a reference ZeroMQ REP server that
-replies with a straight-line trajectory. It is invaluable for verifying end-to-end
-transport and timing before wiring in the real model. Launch it from the sunnypilot
-checkout:
+The bundled `diffusiondrive_server.py` now performs end-to-end DiffusionDrive
+inference. It deserializes the VisionIPC payload streamed by the bridge,
+normalizes it into the camera/LiDAR/status tensors expected by the upstream
+model, and populates the full `modelV2` feature set (trajectory, lane geometry,
+road edges, leads, confidence, and camera odometry).
+
+Launch the server from the sunnypilot checkout after activating the virtual
+environment created during installation:
 
 ```powershell
 C:\DiffusionDrive\dd-env\Scripts\python.exe tools\diffusiondrive\server\diffusiondrive_server.py `
-  --bind tcp://0.0.0.0:5555 --horizon 6.0
+  --diffusiondrive-dir C:\DiffusionDrive\DiffusionDrive `
+  --weights C:\DiffusionDrive\weights\DiffusionDrive.ckpt `
+  --bind tcp://0.0.0.0:5555 `
+  --device cuda
 ```
 
-Monitor the bridge status on the device (`DiffusionDriveStatus` param) to confirm
-frames are flowing and latency is within budget. Once the dummy loop is stable
-replace `build_response` with an adapter that loads the actual DiffusionDrive
-policy and returns its predicted trajectory in the documented format.
+Important flags:
+
+* `--diffusiondrive-dir` – location of the upstream Git checkout cloned by the
+  installer.
+* `--weights` – path to the Lightning checkpoint downloaded from Hugging Face.
+* `--plan-anchor` – optional override if the weights directory contains multiple
+  anchor files. The server auto-discovers `*traj*.npy` when omitted.
+* `--device`/`--dtype` – select CUDA vs. CPU execution and the compute precision.
+
+The process prints warnings for missing checkpoint keys, but the adapter will
+still operate with the fields that load successfully. Monitor the
+`DiffusionDriveStatus` parameter on-device to verify frame flow, sequence, and
+latency. The reply payload now includes:
+
+* The resampled ego trajectory with headings.
+* Lane lines, road edges, and associated confidences derived from the model’s
+  BEV semantic predictions.
+* Up to three lead vehicles translated into the `leadsV3` schema.
+* Model execution timing and `should_stop` hint carried into planner messages.
 
 ## Download helper script
 
@@ -136,7 +158,7 @@ python tools\diffusiondrive\server\download_weights.py --list-only
  ├── README.md                 ← this document
  ├── install_windows.ps1       ← automated Windows installer
  └── server/
-     ├── diffusiondrive_server.py  ← dummy ZeroMQ policy server
+     ├── diffusiondrive_server.py  ← full DiffusionDrive inference server
      ├── download_weights.py       ← Hugging Face snapshot helper
      └── requirements.txt          ← common host-side Python dependencies
 ```
