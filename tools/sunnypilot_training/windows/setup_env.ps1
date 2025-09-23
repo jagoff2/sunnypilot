@@ -9,6 +9,21 @@ $ErrorActionPreference = "Stop"
 
 Set-StrictMode -Version Latest
 
+function Get-MajorMinorVersionString {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Version,
+    [string]$ParameterName = "Version"
+  )
+
+  $parts = $Version -split '\.'
+  if ($parts.Length -ge 2) {
+    return "$($parts[0]).$($parts[1])"
+  }
+
+  throw "Unable to determine major.minor from $ParameterName '$Version'. Provide a value like '3.11.9'."
+}
+
 function Install-Python {
   param(
     [string]$Version,
@@ -28,7 +43,7 @@ function Resolve-Python {
     [string]$Version
   )
 
-  $desiredMajorMinor = ($Version -split '\.')[0..1] -join '.'
+  $desiredMajorMinor = Get-MajorMinorVersionString -Version $Version -ParameterName "Python version"
   $targetDir = Join-Path $env:LOCALAPPDATA "Programs\Python\Python$($Version.Replace('.', ''))"
 
   $existing = Get-Command python.exe -ErrorAction SilentlyContinue
@@ -72,7 +87,7 @@ function Ensure-Venv {
 
   $venvPath = Join-Path $PSScriptRoot "..\..\..\venv"
   $venvPython = Join-Path $venvPath "Scripts\python.exe"
-  $expectedPrefix = ($ExpectedVersion -split '\.')[0..1] -join '.'
+  $expectedPrefix = Get-MajorMinorVersionString -Version $ExpectedVersion -ParameterName "virtual environment Python version"
 
   if (Test-Path $venvPython) {
     $venvVersion = & $venvPython -c "import platform; print(platform.python_version())"
