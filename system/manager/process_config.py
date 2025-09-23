@@ -65,6 +65,12 @@ def use_github_runner(started, params, CP: car.CarParams) -> bool:
   return not PC and params.get_bool("EnableGithubRunner") and (
     not params.get_bool("NetworkMetered") and not params.get_bool("GithubRunnerSufficientVoltage"))
 
+def diffusiondrive_enabled(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return started and params.get_bool("EnableDiffusionDrive")
+
+def diffusiondrive_disabled(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return started and not params.get_bool("EnableDiffusionDrive")
+
 def use_copyparty(started, params, CP: car.CarParams) -> bool:
   return bool(params.get_bool("EnableCopyparty"))
 
@@ -116,7 +122,8 @@ procs = [
   PythonProcess("micd", "system.micd", iscar),
   PythonProcess("timed", "system.timed", always_run, enabled=not PC),
 
-  PythonProcess("modeld", "selfdrive.modeld.modeld", and_(only_onroad, is_stock_model)),
+  PythonProcess("modeld", "selfdrive.modeld.modeld", and_(only_onroad, is_stock_model, diffusiondrive_disabled)),
+  PythonProcess("model_bridge", "selfdrive.model_bridge.model_bridge", and_(only_onroad, diffusiondrive_enabled)),
   PythonProcess("dmonitoringmodeld", "selfdrive.modeld.dmonitoringmodeld", driverview, enabled=(WEBCAM or not PC)),
 
   PythonProcess("sensord", "system.sensord.sensord", only_onroad, enabled=not PC),
@@ -164,8 +171,8 @@ procs = [
 procs += [
   # Models
   PythonProcess("models_manager", "sunnypilot.models.manager", only_offroad),
-  NativeProcess("modeld_snpe", "sunnypilot/modeld", ["./modeld"], and_(only_onroad, is_snpe_model)),
-  NativeProcess("modeld_tinygrad", "sunnypilot/modeld_v2", ["./modeld"], and_(only_onroad, is_tinygrad_model)),
+  NativeProcess("modeld_snpe", "sunnypilot/modeld", ["./modeld"], and_(only_onroad, is_snpe_model, diffusiondrive_disabled)),
+  NativeProcess("modeld_tinygrad", "sunnypilot/modeld_v2", ["./modeld"], and_(only_onroad, is_tinygrad_model, diffusiondrive_disabled)),
 
   # Backup
   PythonProcess("backup_manager", "sunnypilot.sunnylink.backups.manager", and_(only_offroad, sunnylink_ready_shim)),
