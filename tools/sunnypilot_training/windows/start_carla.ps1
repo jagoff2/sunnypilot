@@ -1,11 +1,22 @@
 Param(
-  [string]$CarlaPath = "$PSScriptRoot/../../..",
+  [string]$CarlaPath,
   [int]$Port = 2000,
   [switch]$Offscreen
 )
 
 $ErrorActionPreference = "Stop"
-$carlaExe = Join-Path $CarlaPath "CARLA_0.10.0\CarlaUE4.exe"
+
+if (-Not $CarlaPath) {
+  $envRoot = [Environment]::GetEnvironmentVariable("CARLA_ROOT", "User")
+  if (-Not $envRoot) {
+    $CarlaPath = "$PSScriptRoot/../../..\CARLA_0.10.0"
+  }
+  else {
+    $CarlaPath = $envRoot
+  }
+}
+
+$carlaExe = Join-Path $CarlaPath "CarlaUE4.exe"
 if (-Not (Test-Path $carlaExe)) {
   throw "CARLA executable not found at $carlaExe"
 }

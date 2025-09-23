@@ -24,3 +24,11 @@ optim:
 
 diffusion:
   steps: 20
+
+hydra:
+  run:
+    dir: ${output_dir}
+  sweep:
+    dir: ${output_dir}
+    subdir: .
+  output_subdir: null

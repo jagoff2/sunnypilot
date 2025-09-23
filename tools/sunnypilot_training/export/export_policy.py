@@ -35,12 +35,13 @@ def main() -> None:
   device = torch.device(args.device)
   _, policy = load_checkpoint(args.checkpoint, device)
   metadata = generate_policy_metadata()
+  metadata.model_checkpoint = str(args.checkpoint)
 
   wrapper = PolicyExportWrapper(policy)
   dummy_inputs = {
-    "features_buffer": torch.zeros(metadata.input_shapes["features_buffer"], device=device),
-    "desire": torch.zeros(metadata.input_shapes["desire"], device=device),
-    "traffic_convention": torch.zeros(metadata.input_shapes["traffic_convention"], device=device),
+    "features_buffer": torch.zeros(*metadata.input_shapes["features_buffer"], device=device),
+    "desire": torch.zeros(*metadata.input_shapes["desire"], device=device),
+    "traffic_convention": torch.zeros(*metadata.input_shapes["traffic_convention"], device=device),
   }
   export_onnx(wrapper, dummy_inputs, args.onnx)
   save_tinygrad_weights(policy, args.tinygrad)

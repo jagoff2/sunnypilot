@@ -35,6 +35,7 @@ def main() -> None:
   device = torch.device(args.device)
   vision, _ = load_checkpoint(args.checkpoint, device)
   metadata = generate_vision_metadata()
+  metadata.model_checkpoint = str(args.checkpoint)
 
   wrapper = VisionExportWrapper(vision)
   dummy_inputs = {
