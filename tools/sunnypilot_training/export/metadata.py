@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Dict, OrderedDict
+from typing import Dict
 
 from ..contracts import (
   POLICY_INPUT_SHAPES,
@@ -60,11 +61,11 @@ def generate_policy_metadata() -> MetadataPackage:
 
 
 def vision_output_shapes() -> Dict[str, tuple[int, ...]]:
-  return dict(VISION_OUTPUT_SHAPES)
+  return OrderedDict(VISION_OUTPUT_SHAPES)
 
 
 def policy_output_shapes() -> Dict[str, tuple[int, ...]]:
-  return dict(POLICY_OUTPUT_SHAPES)
+  return OrderedDict(POLICY_OUTPUT_SHAPES)
 
 
 __all__ = [

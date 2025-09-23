@@ -13,12 +13,13 @@ virtual machine.
    ```
 3. **Bootstrap Python, CARLA, and the virtual environment**
    ```powershell
-   .\setup_env.ps1 -PythonVersion 3.11.6 -InstallCarla
+   .\setup_env.ps1 [-InstallCUDA]
    Import-Module .\env.psm1
    Enter-TrainingEnv
    ```
-   This script installs Python, PyTorch (CUDA if available), the CARLA 0.10.0 Python egg,
-   and all training dependencies inside `%LOCALAPPDATA%\sunnypilot-training`.
+   The script installs Python 3.7.9, PyTorch (CUDA wheels when `-InstallCUDA` is specified),
+   the CARLA 0.10.0 Python API, and all training dependencies into the repository `venv/`
+   directory. It also sets the `CARLA_ROOT` user environment variable for later commands.
 4. **Verify GPU visibility**
    ```powershell
    python - <<'PY'
@@ -34,9 +35,9 @@ virtual machine.
 1. In a second PowerShell window (same directory), start CARLA headless:
    ```powershell
    Import-Module .\env.psm1
-   Invoke-Carla -Port 2000 -Quality Epic
+   Invoke-Carla -Port 2000
    ```
-2. CARLA logs appear under `%LOCALAPPDATA%\sunnypilot-training\carla`. Leave this window running.
+2. CARLA uses the `CARLA_ROOT` path configured by `setup_env.ps1`. Leave this window running while collecting data.
 
 ## 3. Collect synthetic driving data
 

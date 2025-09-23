@@ -24,10 +24,12 @@ It targets Windows hosts and CARLA 0.10.0.
 1. **Bootstrap the environment**
    ```powershell
    cd tools\sunnypilot_training\windows
-   .\setup_env.ps1 -PythonVersion 3.11.6
+   .\setup_env.ps1
    Import-Module .\env.psm1
    Enter-TrainingEnv
    ```
+   The script defaults to Python 3.7.9 for CARLA 0.10.0 compatibility. Pass `-InstallCUDA` to
+   install CUDA-enabled PyTorch wheels when using an NVIDIA GPU.
 
 2. **Launch CARLA**
    ```powershell

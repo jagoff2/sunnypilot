@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 from typing import Dict
 
@@ -81,6 +80,7 @@ def save_checkpoint(
       "vision": vision.state_dict(),
       "policy": policy.state_dict(),
       "optimizer": optimizer.state_dict(),
+      "diffusion_steps": policy.schedule.timesteps,
     },
     ckpt_path,
   )
@@ -171,7 +171,7 @@ def main(cfg: DictConfig) -> None:
   )
   scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda" and cfg.mixed_precision))
 
-  output_dir = Path(os.getcwd())
+  output_dir = Path(to_absolute_path(cfg.output_dir))
   output_dir.mkdir(parents=True, exist_ok=True)
 
   for epoch in range(1, cfg.max_epochs + 1):

@@ -13,8 +13,14 @@ from .metadata import MetadataPackage
 
 def load_checkpoint(checkpoint_path: Path, device: torch.device) -> Tuple[DiffusionVisionModel, DiffusionPolicyModel]:
   checkpoint = torch.load(checkpoint_path, map_location=device)
+  default_policy = DiffusionPolicyModel()
+  diffusion_steps = int(checkpoint.get("diffusion_steps", default_policy.schedule.timesteps))
+  if diffusion_steps != default_policy.schedule.timesteps:
+    policy = DiffusionPolicyModel(diffusion_steps=diffusion_steps)
+  else:
+    policy = default_policy
   vision = DiffusionVisionModel().to(device)
-  policy = DiffusionPolicyModel().to(device)
+  policy = policy.to(device)
   vision.load_state_dict(checkpoint["vision"])
   policy.load_state_dict(checkpoint["policy"])
   vision.eval()
