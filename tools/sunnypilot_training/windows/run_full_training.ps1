@@ -128,12 +128,50 @@ function Start-CarlaProcess {
     }
     $searchBases = @([System.IO.Path]::GetDirectoryName($carlaRoot))
   }
+
+  $candidateExeNames = @(
+    "CarlaUnreal.exe",
+    "CarlaUE4.exe",
+    "CarlaUnreal-Win64-Shipping.exe",
+    "CarlaUE4-Win64-Shipping.exe"
+  )
+  $relativeSearchPaths = @(
+    "",
+    "WindowsNoEditor",
+    "CarlaUnreal",
+    "CarlaUE4",
+    "CarlaUnreal\\Binaries\\Win64",
+    "CarlaUE4\\Binaries\\Win64",
+    "WindowsNoEditor\\CarlaUnreal\\Binaries\\Win64",
+    "WindowsNoEditor\\CarlaUE4\\Binaries\\Win64"
+  )
+
   if (-not $carlaExe) {
     if (-not $searchBases) {
       $searchBases = @($carlaRoot, (Join-Path $carlaRoot "WindowsNoEditor"))
     }
+
+    $candidateBases = New-Object System.Collections.Generic.List[string]
     foreach ($base in $searchBases | Where-Object { $_ }) {
-      foreach ($exeName in @("CarlaUnreal.exe", "CarlaUE4.exe")) {
+      foreach ($relative in $relativeSearchPaths) {
+        if ([string]::IsNullOrWhiteSpace($relative)) {
+          $candidateBase = $base
+        }
+        else {
+          $candidateBase = Join-Path $base $relative
+        }
+
+        if ($candidateBase -and -not $candidateBases.Contains($candidateBase)) {
+          $candidateBases.Add($candidateBase)
+        }
+      }
+    }
+
+    foreach ($base in $candidateBases) {
+      if (-not (Test-Path $base)) {
+        continue
+      }
+      foreach ($exeName in $candidateExeNames) {
         $candidate = Join-Path $base $exeName
         if (Test-Path $candidate) {
           $carlaExe = $candidate
@@ -142,18 +180,19 @@ function Start-CarlaProcess {
       }
       if ($carlaExe) { break }
     }
-  }
-  if (-not $carlaExe) {
-    $expectedPaths = foreach ($base in $searchBases | Where-Object { $_ }) {
-      foreach ($exeName in @("CarlaUnreal.exe", "CarlaUE4.exe")) {
-        Join-Path $base $exeName
+
+    if (-not $carlaExe) {
+      $expectedPaths = foreach ($base in $candidateBases) {
+        foreach ($exeName in $candidateExeNames) {
+          Join-Path $base $exeName
+        }
       }
+      if ($carlaRoot.ToLower().EndsWith('.exe')) {
+        $expectedPaths += $carlaRoot
+      }
+      $expectedList = ($expectedPaths) -join ', '
+      throw "CARLA executable not found. Expected one of: $expectedList. Re-run setup_env.ps1 with the default CARLA installation."
     }
-    if ($carlaRoot.ToLower().EndsWith('.exe')) {
-      $expectedPaths += $carlaRoot
-    }
-    $expectedList = ($expectedPaths) -join ', '
-    throw "CARLA executable not found. Expected one of: $expectedList. Re-run setup_env.ps1 with the default CARLA installation."
   }
   $carlaWorkingDir = [System.IO.Path]::GetDirectoryName($carlaExe)
   $arguments = @("-RenderOffScreen", "-quality-level=Epic", "-ResX=1920", "-ResY=1080", "-carla-rpc-port=$Port")
