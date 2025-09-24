@@ -108,26 +108,56 @@ function Start-CarlaProcess {
     $pids = ($existing | Select-Object -ExpandProperty Id) -join ', '
     throw "Detected an existing CARLA process ($names) with PID(s): $pids. Stop it before running the automated pipeline."
   }
-  $carlaRoot = [Environment]::GetEnvironmentVariable("CARLA_ROOT", "User")
+  $carlaRoot = $null
+  foreach ($scope in @("Process", "User", "Machine")) {
+    $value = [Environment]::GetEnvironmentVariable("CARLA_ROOT", $scope)
+    if ($value) {
+      $carlaRoot = $value
+      break
+    }
+  }
   if (-not $carlaRoot) {
     $carlaRoot = Join-Path $RepoRoot "CARLA_0.10.0"
   }
   $carlaRoot = [System.IO.Path]::GetFullPath($carlaRoot)
   $carlaExe = $null
-  foreach ($exeName in @("CarlaUnreal.exe", "CarlaUE4.exe")) {
-    $candidate = Join-Path $carlaRoot $exeName
-    if (Test-Path $candidate) {
-      $carlaExe = $candidate
-      break
+  $searchBases = @()
+  if (Test-Path $carlaRoot -PathType Leaf) {
+    if ($carlaRoot.ToLower().EndsWith('.exe')) {
+      $carlaExe = $carlaRoot
+    }
+    $searchBases = @([System.IO.Path]::GetDirectoryName($carlaRoot))
+  }
+  if (-not $carlaExe) {
+    if (-not $searchBases) {
+      $searchBases = @($carlaRoot, (Join-Path $carlaRoot "WindowsNoEditor"))
+    }
+    foreach ($base in $searchBases | Where-Object { $_ }) {
+      foreach ($exeName in @("CarlaUnreal.exe", "CarlaUE4.exe")) {
+        $candidate = Join-Path $base $exeName
+        if (Test-Path $candidate) {
+          $carlaExe = $candidate
+          break
+        }
+      }
+      if ($carlaExe) { break }
     }
   }
   if (-not $carlaExe) {
-    $expectedPaths = @("CarlaUnreal.exe", "CarlaUE4.exe") | ForEach-Object { Join-Path $carlaRoot $_ }
+    $expectedPaths = foreach ($base in $searchBases | Where-Object { $_ }) {
+      foreach ($exeName in @("CarlaUnreal.exe", "CarlaUE4.exe")) {
+        Join-Path $base $exeName
+      }
+    }
+    if ($carlaRoot.ToLower().EndsWith('.exe')) {
+      $expectedPaths += $carlaRoot
+    }
     $expectedList = ($expectedPaths) -join ', '
     throw "CARLA executable not found. Expected one of: $expectedList. Re-run setup_env.ps1 with the default CARLA installation."
   }
-  $arguments = @("-RenderOffScreen", "-quality-level=Epic", "-ResX=1920", "-ResY=1080", "-world-port=$Port")
-  $process = Start-Process -FilePath $carlaExe -ArgumentList $arguments -PassThru -WorkingDirectory $carlaRoot -WindowStyle Hidden
+  $carlaWorkingDir = [System.IO.Path]::GetDirectoryName($carlaExe)
+  $arguments = @("-RenderOffScreen", "-quality-level=Epic", "-ResX=1920", "-ResY=1080", "-carla-rpc-port=$Port")
+  $process = Start-Process -FilePath $carlaExe -ArgumentList $arguments -PassThru -WorkingDirectory $carlaWorkingDir -WindowStyle Hidden
   Write-Host "Launched CARLA (PID $($process.Id)) on port $Port"
   return $process
 }
