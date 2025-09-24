@@ -49,7 +49,9 @@ function Format-PathForHydra {
     [string]$Path
   )
   $fullPath = [System.IO.Path]::GetFullPath($Path)
-  return ($fullPath -replace '\\', '/')
+  $posixPath = $fullPath -replace '\\', '/'
+  $escaped = $posixPath -replace '"', '\"'
+  return [string]::Concat('"', $escaped, '"')
 }
 
 function Ensure-Directory {
@@ -220,7 +222,7 @@ except Exception:
   traceback.print_exc()
   sys.exit(3)
 
-client = carla.Client("{0}", {1})
+client = carla.Client("{{CARLA_HOST}}", {{CARLA_PORT}})
 client.set_timeout(2.0)
 
 try:
@@ -231,7 +233,7 @@ except Exception as exc:
 else:
   sys.exit(0)
 '@
-  $scriptContent = [string]::Format($scriptTemplate, $CarlaHost, $Port)
+  $scriptContent = $scriptTemplate.Replace("{{CARLA_HOST}}", $CarlaHost).Replace("{{CARLA_PORT}}", [string]$Port)
   $tempScriptPath = [System.IO.Path]::ChangeExtension(
     [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), [System.IO.Path]::GetRandomFileName()),
     ".py"
