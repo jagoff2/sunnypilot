@@ -1,5 +1,5 @@
 Param(
-  [string]$PythonVersion = "3.11.9",
+  [string]$PythonVersion = "3.10.14",
   [switch]$InstallCUDA,
   [string]$CarlaVersion = "0.10.0",
   [string]$InstallDir = "$PSScriptRoot/../../.."
@@ -396,6 +396,13 @@ function Install-CarlaPythonModule {
     (Join-Path $pythonApi 'util'),
     (Join-Path $pythonApi 'agents')
   ) | Where-Object { Test-Path $_ }
+
+  if ($null -ne $additionalPaths) {
+    $additionalPaths = @($additionalPaths)
+  }
+  else {
+    $additionalPaths = @()
+  }
 
   if ($additionalPaths.Count -gt 0) {
     $pthPath = Join-Path $VenvPath "Lib\site-packages\carla_paths.pth"
