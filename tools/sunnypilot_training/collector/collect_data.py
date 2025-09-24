@@ -5,6 +5,7 @@ import argparse
 import logging
 import math
 import queue
+import sys
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,7 +13,13 @@ from typing import Deque, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
-from openpilot.selfdrive.modeld.constants import ModelConstants
+try:
+  from openpilot.selfdrive.modeld.constants import ModelConstants
+except ModuleNotFoundError:
+  repo_root = Path(__file__).resolve().parents[2]
+  if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+  from selfdrive.modeld.constants import ModelConstants
 
 from ..dataset import DEFAULT_SCHEMA, ZarrShardWriter
 from ..sensors import (
