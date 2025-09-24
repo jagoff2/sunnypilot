@@ -218,8 +218,8 @@ function Find-CarlaPythonPackage {
   }
 
   $candidateDirs = @(
-    Join-Path $pythonApi "carla\dist",
-    Join-Path $pythonApi "dist"
+    (Join-Path $pythonApi "carla\dist"),
+    (Join-Path $pythonApi "dist")
   )
 
   foreach ($dir in $candidateDirs) {
