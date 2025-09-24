@@ -209,12 +209,24 @@ function Test-CarlaReady {
   )
   $scriptTemplate = @'
 import sys
+import traceback
+
 try:
   import carla
-  client = carla.Client("{0}", {1})
-  client.set_timeout(2.0)
-  client.get_world()
+except ModuleNotFoundError as exc:
+  print(f"MODULE_NOT_FOUND:{exc}")
+  sys.exit(2)
 except Exception:
+  traceback.print_exc()
+  sys.exit(3)
+
+client = carla.Client("{0}", {1})
+client.set_timeout(2.0)
+
+try:
+  client.get_world()
+except Exception as exc:
+  print(f"CONNECTION_ERROR:{exc}")
   sys.exit(1)
 else:
   sys.exit(0)
@@ -226,8 +238,14 @@ else:
   )
   try {
     [System.IO.File]::WriteAllText($tempScriptPath, $scriptContent)
-    $process = Start-Process -FilePath $PythonExe -ArgumentList $tempScriptPath -NoNewWindow -PassThru -Wait
-    return $process.ExitCode -eq 0
+    $output = & $PythonExe $tempScriptPath 2>&1
+    $exitCode = $LASTEXITCODE
+    $joinedOutput = if ($output) { ($output -join [Environment]::NewLine).Trim() } else { "" }
+    return [PSCustomObject]@{
+      Success = ($exitCode -eq 0)
+      ExitCode = $exitCode
+      Output = $joinedOutput
+    }
   }
   finally {
     if (Test-Path $tempScriptPath) {
@@ -244,10 +262,31 @@ function Wait-CarlaReady {
     [int]$Timeout
   )
   $deadline = (Get-Date).AddSeconds($Timeout)
+  $connectionMessagePrinted = $false
   while ((Get-Date) -lt $deadline) {
-    if (Test-CarlaReady -PythonExe $PythonExe -CarlaHost $CarlaHost -Port $Port) {
+    $result = Test-CarlaReady -PythonExe $PythonExe -CarlaHost $CarlaHost -Port $Port
+    if ($result.Success) {
       Write-Host "CARLA is ready on ${CarlaHost}:${Port}"
       return
+    }
+    if ($result.ExitCode -eq 2) {
+      if ($result.Output) {
+        Write-Host $result.Output
+      }
+      throw "Python module 'carla' is not available for $PythonExe. Activate the training environment (Import-Module .\\env.psm1; Enter-TrainingEnv) or rerun setup_env.ps1."
+    }
+    if ($result.ExitCode -eq 3) {
+      if ($result.Output) {
+        Write-Host $result.Output
+      }
+      throw "Failed to import the CARLA Python API with $PythonExe. Review the traceback above and reinstall the environment if needed."
+    }
+    if (-not $connectionMessagePrinted) {
+      if ($result.Output) {
+        Write-Host $result.Output
+      }
+      Write-Host "Waiting for CARLA to accept connections on ${CarlaHost}:${Port}..."
+      $connectionMessagePrinted = $true
     }
     Start-Sleep -Seconds 2
   }
