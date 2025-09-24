@@ -24,18 +24,104 @@ function Get-MajorMinorVersionString {
   throw "Unable to determine major.minor from $ParameterName '$Version'. Provide a value like '3.11.9'."
 }
 
-function Install-Python {
+function Get-PythonInstallerCandidates {
   param(
-    [string]$Version,
-    [string]$Destination
+    [string]$Version
   )
 
-  Write-Host "Installing Python $Version"
-  $pythonInstaller = "https://www.python.org/ftp/python/$Version/python-$Version-amd64.exe"
-  $installerPath = Join-Path $env:TEMP "python-$Version.exe"
-  Invoke-WebRequest -Uri $pythonInstaller -OutFile $installerPath -MaximumRedirection 5
-  Start-Process -FilePath $installerPath -ArgumentList "/quiet InstallAllUsers=0 PrependPath=1 TargetDir=$Destination" -Wait
-  Remove-Item $installerPath -ErrorAction SilentlyContinue
+  if ($null -eq $Version -or $Version.Trim().Length -eq 0) {
+    throw "Python version parameter cannot be empty."
+  }
+
+  $candidates = @($Version)
+
+  $majorMinor = Get-MajorMinorVersionString -Version $Version -ParameterName "Python version"
+  if ($majorMinor -eq "3.10") {
+    $fallbacks = @(
+      "3.10.14",
+      "3.10.13",
+      "3.10.12",
+      "3.10.11",
+      "3.10.10",
+      "3.10.9",
+      "3.10.8",
+      "3.10.7",
+      "3.10.6",
+      "3.10.5",
+      "3.10.4",
+      "3.10.3",
+      "3.10.2",
+      "3.10.1",
+      "3.10.0"
+    )
+
+    foreach ($fallback in $fallbacks) {
+      if ($candidates -notcontains $fallback) {
+        $candidates += $fallback
+      }
+    }
+  }
+
+  if ($candidates.Count -eq 0) {
+    throw "Unable to determine candidate installers for Python version '$Version'."
+  }
+
+  return $candidates
+}
+
+function Install-Python {
+  param(
+    [string]$Version
+  )
+
+  $candidates = Get-PythonInstallerCandidates -Version $Version
+  $lastError = $null
+
+  foreach ($candidate in $candidates) {
+    $pythonInstaller = "https://www.python.org/ftp/python/$candidate/python-$candidate-amd64.exe"
+    $installerPath = Join-Path $env:TEMP "python-$candidate.exe"
+    $targetDir = Join-Path $env:LOCALAPPDATA "Programs\Python\Python$($candidate.Replace('.', ''))"
+
+    Write-Host "Attempting Python $candidate installer download"
+    try {
+      Invoke-WebRequest -Uri $pythonInstaller -OutFile $installerPath -MaximumRedirection 5
+    }
+    catch {
+      $lastError = $_
+      Write-Warning "Failed to download Python $candidate from $pythonInstaller ($($lastError.Exception.Message))."
+      Remove-Item $installerPath -ErrorAction SilentlyContinue
+      continue
+    }
+
+    try {
+      Start-Process -FilePath $installerPath -ArgumentList "/quiet InstallAllUsers=0 PrependPath=1 TargetDir=$targetDir" -Wait
+    }
+    catch {
+      $lastError = $_
+      Write-Warning "Python $candidate installer failed ($($lastError.Exception.Message))."
+      Remove-Item $installerPath -ErrorAction SilentlyContinue
+      continue
+    }
+    finally {
+      Remove-Item $installerPath -ErrorAction SilentlyContinue
+    }
+
+    if ($candidate -ne $Version) {
+      Write-Warning "Requested Python $Version but installed $candidate instead because the requested build was unavailable."
+    }
+
+    Write-Host "Installed Python $candidate to $targetDir"
+    return [PSCustomObject]@{
+      Version = $candidate
+      PythonExe = Join-Path $targetDir "python.exe"
+    }
+  }
+
+  if ($lastError) {
+    throw "Unable to install Python $Version. Last error: $($lastError.Exception.Message)"
+  }
+
+  throw "Unable to install Python $Version because no suitable installer was found."
 }
 
 function Resolve-Python {
@@ -44,7 +130,6 @@ function Resolve-Python {
   )
 
   $desiredMajorMinor = Get-MajorMinorVersionString -Version $Version -ParameterName "Python version"
-  $targetDir = Join-Path $env:LOCALAPPDATA "Programs\Python\Python$($Version.Replace('.', ''))"
 
   $existing = Get-Command python.exe -ErrorAction SilentlyContinue
   if ($existing) {
@@ -66,8 +151,8 @@ function Resolve-Python {
       $currentVersion = $null
     }
     if ($null -eq $currentVersion -or -not $currentVersion.StartsWith($desiredMajorMinor)) {
-      Install-Python -Version $Version -Destination $targetDir
-      return (Join-Path $targetDir "python.exe")
+      $installResult = Install-Python -Version $Version
+      return $installResult.PythonExe
     }
     else {
       Write-Host "Found Python $currentVersion on PATH"
@@ -75,8 +160,8 @@ function Resolve-Python {
     }
   }
 
-  Install-Python -Version $Version -Destination $targetDir
-  return (Join-Path $targetDir "python.exe")
+  $installResult = Install-Python -Version $Version
+  return $installResult.PythonExe
 }
 
 function Ensure-Venv {
