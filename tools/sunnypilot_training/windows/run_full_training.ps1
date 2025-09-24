@@ -100,7 +100,14 @@ function Start-CarlaProcess {
     [int]$Port,
     [string]$RepoRoot
   )
-  $processNames = @("CarlaUnreal", "CarlaUE4")
+  $processNames = @(
+    "CarlaUnreal",
+    "CarlaUE4",
+    "CarlaUnreal-Win64-Shipping",
+    "CarlaUE4-Win64-Shipping",
+    "CarlaUE5",
+    "CarlaUE5-Win64-Shipping"
+  )
   $existing = foreach ($name in $processNames) {
     Get-Process -Name $name -ErrorAction SilentlyContinue
   }
