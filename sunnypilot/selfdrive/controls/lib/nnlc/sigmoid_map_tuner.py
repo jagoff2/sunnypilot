@@ -98,7 +98,9 @@ class SigmoidMapTuner:
     self._base_torque_from_lataccel = lac_torque.torque_from_lateral_accel
     self._base_lataccel_from_torque = lac_torque.lateral_accel_from_torque
 
-    self._file_path = os.path.join(Paths.persist_root(), "sigmoid_maps", f"{car_fingerprint}_nnlc.json")
+    self._storage_dirs = self._candidate_storage_dirs()
+    self._file_name = f"{car_fingerprint}_nnlc.json"
+    self._file_path = os.path.join(self._storage_dirs[0], self._file_name)
     self._current_speed = 0.0
     self._solution: Optional[SigmoidMapSolution] = None
     self._current_roll_compensation = 0.0
@@ -351,20 +353,39 @@ class SigmoidMapTuner:
     if self._solution is None:
       return
 
-    os.makedirs(os.path.dirname(self._file_path), exist_ok=True)
-    with open(self._file_path, "w", encoding="utf-8") as f:
-      json.dump(self._solution.serialize(), f)
+    serialized = self._solution.serialize()
+    for directory in self._storage_dirs:
+      path = os.path.join(directory, self._file_name)
+      try:
+        os.makedirs(directory, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+          json.dump(serialized, f)
+        self._file_path = path
+        return
+      except OSError as e:
+        cloudlog.event("sigmoid_map_tuner_write_failed", path=path, error=str(e))
 
   def _load_solution(self) -> None:
-    if not os.path.exists(self._file_path):
-      return
-    try:
-      with open(self._file_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-      solution = SigmoidMapSolution.deserialize(data)
-      if solution.slices:
-        self._solution = solution
-        self._update_torque_params()
-    except (OSError, json.JSONDecodeError):
-      pass
+    for directory in self._storage_dirs:
+      path = os.path.join(directory, self._file_name)
+      if not os.path.exists(path):
+        continue
+      try:
+        with open(path, "r", encoding="utf-8") as f:
+          data = json.load(f)
+        solution = SigmoidMapSolution.deserialize(data)
+        if solution.slices:
+          self._solution = solution
+          self._file_path = path
+          self._update_torque_params()
+        return
+      except (OSError, json.JSONDecodeError):
+        continue
+
+  def _candidate_storage_dirs(self) -> List[str]:
+    return [
+      os.path.join(Paths.persist_root(), "sigmoid_maps"),
+      "/data/params/d_tmp/sigmoid_maps",
+      os.path.join(Paths.config_root(), "sigmoid_maps"),
+    ]
 
