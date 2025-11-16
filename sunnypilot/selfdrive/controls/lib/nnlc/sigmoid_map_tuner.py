@@ -16,6 +16,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 from opendbc.sunnypilot.car.interfaces import LatControlInputs
+from openpilot.common.logger import cloudlog
 from openpilot.system.hardware.hw import Paths
 
 
@@ -217,7 +218,11 @@ class SigmoidMapTuner:
     for speed_idx in range(len(self._speed_centers)):
       if self._slice_has_coverage(speed_idx):
         ready_slices += 1
-    print(f"[SigmoidMapTuner] ready slices: {ready_slices}/{MIN_READY_SPEED_SLICES}, bins: {len(self._bins)}"); return ready_slices >= MIN_READY_SPEED_SLICES
+    cloudlog.event("sigmoid_map_tuner_ready",
+                   ready_slices=ready_slices,
+                   required_slices=MIN_READY_SPEED_SLICES,
+                   bin_count=len(self._bins))
+    return ready_slices >= MIN_READY_SPEED_SLICES
 
   def _slice_has_coverage(self, speed_idx: int) -> bool:
     pos_high = False
