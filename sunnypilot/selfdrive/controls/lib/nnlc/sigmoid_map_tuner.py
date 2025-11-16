@@ -383,9 +383,5 @@ class SigmoidMapTuner:
         continue
 
   def _candidate_storage_dirs(self) -> List[str]:
-    return [
-      os.path.join(Paths.persist_root(), "sigmoid_maps"),
-      "/data/params/d_tmp/sigmoid_maps",
-      os.path.join(Paths.config_root(), "sigmoid_maps"),
-    ]
+    return ["/data/params/d_tmp/sigmoid_maps"]
 
