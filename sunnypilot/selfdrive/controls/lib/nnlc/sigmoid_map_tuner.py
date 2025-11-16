@@ -16,7 +16,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 from opendbc.sunnypilot.car.interfaces import LatControlInputs
-from openpilot.common.logger import cloudlog
+from openpilot.common.swaglog import cloudlog
 from openpilot.system.hardware.hw import Paths
 
 
