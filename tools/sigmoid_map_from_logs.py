@@ -67,10 +67,16 @@ def _find_logs(path: Path) -> list[Path]:
   return sorted({p for p in paths})
 
 
+def _iter_log_messages(log_paths: Sequence[Path]):
+  for path in log_paths:
+    for msg in LogReader(str(path)):
+      yield msg
+
+
 def _extract_car_params(log_paths: list[Path]) -> tuple[car.CarParams, custom.CarParamsSP]:
   cp_msg = None
   cp_sp_msg = None
-  for msg in LogReader([str(p) for p in log_paths]):
+  for msg in _iter_log_messages(log_paths):
     if msg.which() == "carParams" and cp_msg is None:
       cp_msg = msg.carParams
     elif msg.which() == "carParamsSP" and cp_sp_msg is None:
@@ -97,7 +103,7 @@ def _process_logs(log_paths: list[Path], output_dir: Path) -> Path:
   lp_stiffness = cp_msg.tireStiffnessFactor
   last_car_state = None
 
-  for msg in LogReader([str(p) for p in log_paths]):
+  for msg in _iter_log_messages(log_paths):
     which = msg.which()
     if which == "carState":
       last_car_state = msg.carState
