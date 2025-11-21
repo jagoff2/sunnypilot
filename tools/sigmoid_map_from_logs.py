@@ -23,7 +23,7 @@ from openpilot.selfdrive.controls.lib.latcontrol_torque import LOW_SPEED_X, LOW_
 from openpilot.sunnypilot.selfdrive.controls.lib.nnlc.sigmoid_map_tuner import SigmoidMapTuner  # noqa: E402
 from tools.lib.logreader import LogReader  # noqa: E402
 
-LOG_SUFFIXES = (".rlog", ".qlog")
+LOG_GLOB_PATTERNS = ("*.rlog*", "*.qlog*")
 
 
 class OfflineLatControlAdapter:
@@ -57,14 +57,12 @@ class OfflineSigmoidMapTuner(SigmoidMapTuner):
 
 
 def _find_logs(path: Path) -> list[Path]:
-  paths: list[Path] = []
-  for candidate in path.rglob("*"):
-    if not candidate.is_file():
-      continue
-    name = candidate.name.lower()
-    if any(suffix in name for suffix in LOG_SUFFIXES):
-      paths.append(candidate)
-  return sorted({p for p in paths})
+  paths: set[Path] = set()
+  for pattern in LOG_GLOB_PATTERNS:
+    for candidate in path.rglob(pattern):
+      if candidate.is_file():
+        paths.add(candidate)
+  return sorted(paths)
 
 
 def _iter_log_messages(log_paths: Sequence[Path]):
