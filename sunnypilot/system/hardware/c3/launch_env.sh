@@ -6,6 +6,8 @@ export NUMEXPR_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export VECLIB_MAXIMUM_THREADS=1
 
+export USBGPU=1
+
 if [ -z "$AGNOS_VERSION" ]; then
   export AGNOS_VERSION="12.8"
 fi

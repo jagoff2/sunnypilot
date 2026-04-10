@@ -15,6 +15,15 @@ export VECLIB_MAXIMUM_THREADS=1
 # headroom for this until ui is moved to the CPU.
 export QCOM_PRIORITY=12
 
+MODEL_PATH="/sys/firmware/devicetree/base/model"
+if [ -r "$MODEL_PATH" ]; then
+  MODEL="$(tr -d '\0' < "$MODEL_PATH")"
+  if [ "$MODEL" = "comma tizi" ]; then
+    # Force USB AMD compilation/runtime on C3X boots so rebuilds don't fall back to QCOM.
+    export USBGPU=1
+  fi
+fi
+
 if [ -z "$AGNOS_VERSION" ]; then
   export AGNOS_VERSION="17.2"
 fi
