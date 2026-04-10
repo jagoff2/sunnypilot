@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 import os
 from openpilot.system.hardware import TICI
+from openpilot.selfdrive.modeld.tinygrad_helpers import USB_GPU_DEV
 os.environ['DEV'] = 'QCOM' if TICI else 'CPU'
 USBGPU = "USBGPU" in os.environ
 if USBGPU:
-  os.environ['DEV'] = 'AMD'
-  os.environ['AMD_IFACE'] = 'USB'
+  os.environ['DEV'] = USB_GPU_DEV
+  os.environ.pop('AMD_IFACE', None)
 import time
 import numpy as np
 import cereal.messaging as messaging
