@@ -41,6 +41,7 @@ bin/
 *.stats
 *.pkl
 *.pkl*
+**/models/tg_compiled_flags.json
 config.json
 compile_commands.json
 compare_runtime*.html

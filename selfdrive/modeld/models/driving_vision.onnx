@@ -1,3 +1,7 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:7af05e03fd170653ff5771baf373a2c57b363da12c4c411cd416dee067b4cf58
-size 23266366
+STUB GIGA MODEL FILE
+File: driving_vision.onnx
+This placeholder is intentionally committed as a plain git blob so installer clone does not depend on Sunnypilot GitLab LFS upload access.
+Replace this file on-device with the real giga_model ONNX before any model compilation or first modeld build.
+Source commit: commaai/openpilot 1e70fec1387dba953a2edf4b6d3c678057590290
+Expected size: 122086874
+Expected sha256: 48f12ce53c55d435b3eac38cca3afe5b131d7a38ab1de176500b050228bb8194

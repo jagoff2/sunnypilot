@@ -1,3 +1,7 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:eb6992bd60bada6162fea298e1a414b6b3d6a326db4eda46b9de62bcd8554754
-size 13393859
+STUB GIGA MODEL FILE
+File: driving_off_policy.onnx
+This placeholder is intentionally committed as a plain git blob so installer clone does not depend on Sunnypilot GitLab LFS upload access.
+Replace this file on-device with the real giga_model ONNX before any model compilation or first modeld build.
+Source commit: commaai/openpilot 1e70fec1387dba953a2edf4b6d3c678057590290
+Expected size: 13393365
+Expected sha256: 35e4a5949007ad7de62e6f3af66eab119074e31a77835895e885140f3b98e9a7

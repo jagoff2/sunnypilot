@@ -1,5 +1,16 @@
-import os
 import glob
+import json
+import os
+from pathlib import Path
+from SCons.Script import Value
+from openpilot.selfdrive.modeld.tinygrad_helpers import (
+  format_tinygrad_env,
+  get_runtime_flags_from_compile_env,
+  get_tinygrad_available_devices,
+  get_tinygrad_compile_env,
+  get_tinygrad_compile_image_flag,
+  write_tinygrad_compiled_flags,
+)
 
 Import('env', 'arch')
 lenv = env.Clone()
@@ -21,14 +32,19 @@ if PC:
   if outputs:
     lenv.Command(outputs, inputs, cmd)
 
-tg_flags = {
-  'larch64': 'DEV=QCOM FLOAT16=1 NOLOCALS=1 JIT_BATCH_SIZE=0',
-  'Darwin': f'DEV=CPU THREADS=0 HOME={os.path.expanduser("~")}',
-}.get(arch, 'DEV=CPU CPU_LLVM=1 THREADS=0')
+tg_compile_env = get_tinygrad_compile_env(arch, get_tinygrad_available_devices())
+tg_runtime_flags = get_runtime_flags_from_compile_env(tg_compile_env)
+tg_flags = format_tinygrad_env(tg_compile_env, include_home=arch == 'Darwin')
+image_flag = get_tinygrad_compile_image_flag(arch)
 
-image_flag = {
-  'larch64': 'IMAGE=2',
-}.get(arch, 'IMAGE=0')
+def do_write_tg_compiled_flags(target, source, env):
+  write_tinygrad_compiled_flags(Path(str(target[0])), tg_runtime_flags)
+
+compiled_flags_node = lenv.Command(
+  File("models/tg_compiled_flags.json").abspath,
+  tinygrad_files + [Value(json.dumps(tg_compile_env, sort_keys=True))],
+  do_write_tg_compiled_flags,
+)
 
 def tg_compile(flags, model_name):
   pythonpath_string = 'PYTHONPATH="${PYTHONPATH}:' + env.Dir("#tinygrad_repo").abspath + '"'
@@ -37,7 +53,7 @@ def tg_compile(flags, model_name):
 
   return lenv.Command(
     out,
-    [fn + ".onnx"] + tinygrad_files,
+    [fn + ".onnx"] + tinygrad_files + [compiled_flags_node],
     f'{pythonpath_string} {flags} {image_flag} python3 {Dir("#tinygrad_repo").abspath}/examples/openpilot/compile3.py {fn}.onnx {out}'
   )
 
@@ -56,4 +72,4 @@ for cam in [_ar_ox_fisheye, _os_fisheye]:
   w, h = cam.width, cam.height
   for bl in [2, 5]:
     warp_targets.append(File(f"models/warp_{w}x{h}_b{bl}_tinygrad.pkl").abspath)
-lenv.Command(warp_targets, tinygrad_files + script_files, compile_warp_cmd)
+lenv.Command(warp_targets, tinygrad_files + script_files + [compiled_flags_node], compile_warp_cmd)

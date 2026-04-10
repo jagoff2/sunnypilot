@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 import os
 from openpilot.system.hardware import TICI
-os.environ['DEV'] = 'QCOM' if TICI else 'CPU'
+from openpilot.selfdrive.modeld.tinygrad_helpers import MODELS_DIR, get_tinygrad_runtime_env, set_tinygrad_backend_from_compiled_flags
+set_tinygrad_backend_from_compiled_flags(fallback_env=get_tinygrad_runtime_env(default_to_qcom=TICI))
 from tinygrad.tensor import Tensor
 import time
 import pickle
@@ -23,7 +24,6 @@ PROCESS_NAME = "selfdrive.modeld.dmonitoringmodeld"
 SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
 MODEL_PKL_PATH = Path(__file__).parent / 'models/dmonitoring_model_tinygrad.pkl'
 METADATA_PATH = Path(__file__).parent / 'models/dmonitoring_model_metadata.pkl'
-MODELS_DIR = Path(__file__).parent / 'models'
 
 class ModelState:
   inputs: dict[str, np.ndarray]
