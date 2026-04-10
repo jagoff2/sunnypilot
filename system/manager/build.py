@@ -20,7 +20,7 @@ MAX_BUILD_PROGRESS = 100
 def build(spinner: Spinner, dirty: bool = False, minimal: bool = False) -> None:
   env = os.environ.copy()
   env['SCONS_PROGRESS'] = "1"
-  nproc = os.cpu_count()
+  nproc = 1 if env.get("USBGPU") else os.cpu_count()
   if nproc is None:
     nproc = 2
 
