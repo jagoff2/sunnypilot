@@ -7,16 +7,18 @@ See the LICENSE.md file in the root directory for more details.
 
 from openpilot.sunnypilot.selfdrive.controls.lib.nnlc.nnlc import NeuralNetworkLateralControl
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_ext_override import LatControlTorqueExtOverride
+from openpilot.sunnypilot.selfdrive.controls.lib.kona_residual_controller import KonaResidualController
 
 
 class LatControlTorqueExt(NeuralNetworkLateralControl, LatControlTorqueExtOverride):
   def __init__(self, lac_torque, CP, CP_SP, CI):
     NeuralNetworkLateralControl.__init__(self, lac_torque, CP, CP_SP, CI)
     LatControlTorqueExtOverride.__init__(self, CP)
+    self.residual = KonaResidualController(CP, self.params, lac_torque.dt)
 
   def update(self, CS, VM, pid, params, ff, pid_log, setpoint, measurement, calibrated_pose, roll_compensation,
              desired_lateral_accel, actual_lateral_accel, lateral_accel_deadzone, gravity_adjusted_lateral_accel,
-             desired_curvature, actual_curvature, steer_limited_by_safety, output_torque):
+             desired_curvature, actual_curvature, steer_limited_by_safety, output_torque, car_output=None):
     self._ff = ff
     self._pid = pid
     self._pid_log = pid_log
@@ -35,5 +37,6 @@ class LatControlTorqueExt(NeuralNetworkLateralControl, LatControlTorqueExtOverri
     self.update_calculations(CS, VM, desired_lateral_accel)
     self.update_jerk_aware_torque_control(CS, roll_compensation, gravity_adjusted_lateral_accel)
     self.update_neural_network_feedforward(CS, params, calibrated_pose)
+    self._output_torque = self.residual.update(CS, desired_curvature, self._output_torque, calibrated_pose, car_output)
 
     return self._pid_log, self._output_torque

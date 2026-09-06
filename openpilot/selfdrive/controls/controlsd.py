@@ -147,9 +147,12 @@ class Controls(ControlsExt):
     lat_delay = self.sm["lateralDelay"].lateralDelay + LAT_SMOOTH_SECONDS
 
     actuators.curvature = self.desired_curvature
+    torque_feedback = {}
+    if self.CP.lateralTuning.which() == 'torque':
+      torque_feedback['car_output'] = self.sm['carOutput'] if self.sm.all_checks(['carOutput']) else None
     steer, lateral_output, lac_log = self.LaC.update(CC.latActive, CS, self.VM, lp,
                                                      self.steer_limited_by_safety, self.desired_curvature,
-                                                     self.calibrated_pose, curvature_limited, lat_delay)
+                                                     self.calibrated_pose, curvature_limited, lat_delay, **torque_feedback)
     actuators.torque = float(steer)
     if self.CP.steerControlType == car.CarParams.SteerControlType.curvature:
       actuators.curvature = float(lateral_output)
