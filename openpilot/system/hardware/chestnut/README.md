@@ -2,7 +2,7 @@
 
 This checkout defaults to `CHESTNUT_DOCK=asm2464` in `launch_env.sh` for the
 previously flashed DIY USB-to-PCIe dock. The observed device is `3801:0001`,
-manufacturer `tiny`, product `custom ed4e39b7-CLEAN`. It uses the same USB
+manufacturer `tiny`, product `custom 6e1e151e-CLEAN`. It uses the same USB
 identity as Chestnut, so USB identity alone cannot select the supply-sensor policy.
 
 Both model runners probe the bridge directly before loading an eGPU model.
