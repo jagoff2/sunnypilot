@@ -3,10 +3,10 @@ import time
 from openpilot.common.hardware.usb import CHESTNUT_USB_PRODUCT, is_chestnut_usb_id
 from openpilot.common.version import get_build_metadata, CHESTNUT_BRANCHES
 from openpilot.selfdrive.modeld.helpers import MODELS_DIR, chestnut_compiled
+from openpilot.system.hardware.chestnut.readiness import CHESTNUT_PCIE_READY, chestnut_power_fault, chestnut_powered
 
 
 CHESTNUT_RELEASE_BRANCHES = ("release-chestnut", "release-chestnut-staging")
-CHESTNUT_POWERED_VOLTAGE = 5000
 GPU_TEMP_LIMIT = 100.
 MEMORY_TEMP_LIMIT = 95.
 TEMP_HYSTERESIS = 5.
@@ -53,19 +53,19 @@ class ChestnutStatus:
       self.usb_failed = True
 
     if not offroad and state is not None:
-      powered = state.supplyVoltage >= CHESTNUT_POWERED_VOLTAGE
-      power_lost = state.supplyFault or not powered
+      powered = chestnut_powered(state)
+      power_lost = chestnut_power_fault(state)
       if self.model_attempted and power_lost and not self.power_lost:
         self.power_unavailable = not self.power_seen
       self.power_seen |= powered
 
     if not offroad and self.model_attempted and state is not None:
-      self.link_failures = self.link_failures + 1 if state.pcieLtssm != 0x78 else 0
+      self.link_failures = self.link_failures + 1 if state.pcieLtssm != CHESTNUT_PCIE_READY else 0
       self.pcie_failed |= self.link_failures >= 2 or power_lost
       self.power_lost |= power_lost
 
     if self.pcie_failed and self.power_lost and state is not None:
-      self.power_restored |= not state.supplyFault and state.supplyVoltage >= CHESTNUT_POWERED_VOLTAGE
+      self.power_restored |= chestnut_powered(state)
     if self.usb_failed:
       self.pcie_failed = False
       self.power_seen = False

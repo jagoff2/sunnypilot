@@ -15,6 +15,10 @@ export VECLIB_MAXIMUM_THREADS=1
 # headroom for this until ui is moved to the CPU.
 export QCOM_PRIORITY=12
 
+# This checkout uses the DIY ASM2464 dock without an INA supply sensor.
+# Set CHESTNUT_DOCK=chestnut to require supply telemetry on a production Chestnut.
+export CHESTNUT_DOCK="${CHESTNUT_DOCK:-asm2464}"
+
 if [ -z "$AGNOS_VERSION" ]; then
   export AGNOS_VERSION="19.7"
 fi

@@ -8,10 +8,8 @@ from openpilot.common.params import Params
 
 
 def get_lat_delay(params: Params, stock_lat_delay: float) -> float:
-# live learning on: use what lagd publishes.
-# off: use the fixed steerActuatorDelay + software delay sum that LagdToggle caches.
-
+  # Match the c3x delay source used by modeld and the torque-controller lookahead.
   if params.get_bool("LagdToggle"):
-    return stock_lat_delay
+    return float(params.get("LagdValueCache", return_default=True))
 
-  return float(params.get("LagdValueCache", return_default=True))
+  return stock_lat_delay

@@ -18,6 +18,8 @@ from tinygrad.tensor import Tensor
 import openpilot.cereal.messaging as messaging
 from openpilot.common.hardware import COMMA_HARDWARE
 from openpilot.selfdrive.modeld.helpers import chestnut_present, load_oob
+from openpilot.common.hardware.usb import CHESTNUT_USB_PRODUCT
+from openpilot.system.hardware.chestnut.readiness import wait_for_chestnut_ready
 from openpilot.cereal import log
 from opendbc.car.structs import car
 from openpilot.cereal.services import SERVICE_LIST
@@ -37,6 +39,8 @@ from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
 from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, smooth_value
 from openpilot.selfdrive.modeld.modeld import ChestnutState
+from openpilot.selfdrive.modeld.lane_centering_integration import LaneCenteringModelAdapter, update_lane_change_helpers
+from openpilot.selfdrive.modeld.lane_centering import ACTION_SMOOTH_SECONDS
 
 from openpilot.sunnypilot.modeld_v2.fill_model_msg import fill_model_msg, fill_pose_msg, PublishState, get_curvature_from_output
 from openpilot.sunnypilot.modeld_v2.constants import Plan
@@ -278,7 +282,8 @@ class ModelState(ModelStateBase):
     return outputs
 
   def get_action_from_model(self, model_output: dict[str, np.ndarray], prev_action: log.ModelDataV2.Action,
-                            lat_action_t: float, long_action_t: float, v_ego: float) -> log.ModelDataV2.Action:
+                            lat_action_t: float, long_action_t: float, v_ego: float,
+                            lateral_smooth_seconds: float | None = None) -> log.ModelDataV2.Action:
     if 'action' not in model_output:
       plan = model_output['plan'][0]
       desired_accel = get_accel_from_plan(plan[:, Plan.VELOCITY][:, 0], plan[:, Plan.ACCELERATION][:, 0], self.constants.T_IDXS,
@@ -296,7 +301,8 @@ class ModelState(ModelStateBase):
 
     if self.generation is not None and self.generation >= 10: # smooth curvature for post FOF models
       if v_ego > self.MIN_LAT_CONTROL_SPEED:
-        desired_curvature = smooth_value(desired_curvature, prev_action.desiredCurvature, self.LAT_SMOOTH_SECONDS)
+        desired_curvature = smooth_value(desired_curvature, prev_action.desiredCurvature,
+                                        self.LAT_SMOOTH_SECONDS if lateral_smooth_seconds is None else lateral_smooth_seconds)
       else:
         desired_curvature = prev_action.desiredCurvature
 
@@ -311,13 +317,19 @@ def main(demo=False):
   setproctitle(PROCESS_NAME)
   config_realtime_process(7, 54)
 
-  CHESTNUT = chestnut_present()
+  chestnut_available = chestnut_present()
+  CHESTNUT = chestnut_available and wait_for_chestnut_ready(CHESTNUT_USB_PRODUCT)
+  if chestnut_available and not CHESTNUT:
+    cloudlog.warning("Chestnut USB/PCIe readiness check failed, using the small model")
   if CHESTNUT:
     os.environ['HCQDEV_WAIT_TIMEOUT_MS'] = '3000'
 
   params = Params()
   params.put_bool("ChestnutLoading", CHESTNUT)
-  params.remove("ChestnutActive")
+  if chestnut_available and not CHESTNUT:
+    params.put_bool("ChestnutActive", False)
+  else:
+    params.remove("ChestnutActive")
 
   # visionipc clients
   while True:
@@ -400,7 +412,7 @@ def main(demo=False):
 
   # TODO Move smooth seconds to action function
   long_delay = CP.longitudinalActuatorDelay + model.LONG_SMOOTH_SECONDS
-  prev_action = log.ModelDataV2.Action()
+  lane_centering = LaneCenteringModelAdapter("absolute")
 
   DH = DesireHelper()
   meta_constants = load_meta_constants()
@@ -448,7 +460,7 @@ def main(demo=False):
       model.lat_delay = get_lat_delay(params, sm["lateralDelay"].lateralDelay)
       model.PLANPLUS_CONTROL = params.get("PlanplusControl", return_default=True)
       camera_offset_helper.set_offset(params.get("CameraOffset", return_default=True))
-    lat_delay = model.lat_delay + model.LAT_SMOOTH_SECONDS
+    lat_delay = model.lat_delay + ACTION_SMOOTH_SECONDS
     if sm.updated["extrinsicsCalibration"] and sm.seen['narrowRoadCameraState'] and sm.seen['deviceState']:
       device_from_calib_euler = np.array(sm["extrinsicsCalibration"].rpyCalib, dtype=np.float32)
       dc = DEVICE_CAMERAS[(str(sm['deviceState'].deviceType), str(sm['narrowRoadCameraState'].sensor))]
@@ -522,19 +534,17 @@ def main(demo=False):
       posenet_send = messaging.new_message('cameraOdometry')
       mdv2sp_send = messaging.new_message('modelDataV2SP')
 
-      action = model.get_action_from_model(model_output, prev_action, lat_action_t, long_action_t, v_ego)
-      prev_action = action
-      fill_model_msg(drivingdata_send, modelv2_send, model_output, action,
+      update_lane_change_helpers(model_output, sm['carState'], sm['carControl'].latActive, v_ego,
+                                 DH, RELC, mdv2sp_send.modelDataV2SP)
+      selected_model_output, action, _ = lane_centering.update(
+        model_output, model.get_action_from_model, sm, live_calib_seen, DH.lane_change_state,
+        meta_main.timestamp_eof, v_ego, lat_action_t, long_action_t,
+      )
+      fill_model_msg(drivingdata_send, modelv2_send, selected_model_output, action,
                      publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
                      frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, live_calib_seen, meta_constants)
       modelv2_send.modelV2.big = model.chestnut
 
-      desire_state = modelv2_send.modelV2.meta.desireState
-      l_lane_change_prob = desire_state[log.Desire.laneChangeLeft]
-      r_lane_change_prob = desire_state[log.Desire.laneChangeRight]
-      lane_change_prob = l_lane_change_prob + r_lane_change_prob
-      left_edge, right_edge = RELC.update_and_fill(modelv2_send.modelV2, mdv2sp_send.modelDataV2SP, v_ego)
-      DH.update(sm['carState'], sm['carControl'].latActive, lane_change_prob, left_edge, right_edge)
       modelv2_send.modelV2.meta.laneChangeState = DH.lane_change_state
       modelv2_send.modelV2.meta.laneChangeDirection = DH.lane_change_direction
       mdv2sp_send.modelDataV2SP.laneTurnDirection = DH.lane_turn_direction

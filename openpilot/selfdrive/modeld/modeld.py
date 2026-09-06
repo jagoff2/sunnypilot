@@ -31,9 +31,12 @@ from openpilot.selfdrive.modeld.parse_model_outputs import Parser
 from openpilot.selfdrive.modeld.compile_modeld import make_input_queues, nv12_copy_size, MODELD_INPUTS
 from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_driving_model_data, fill_pose_msg, PublishState
 from openpilot.common.file_chunker import open_file_chunked
-from openpilot.common.hardware.usb import CHESTNUT_USB_IDS
+from openpilot.common.hardware.usb import CHESTNUT_USB_IDS, CHESTNUT_USB_PRODUCT
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
-from openpilot.selfdrive.modeld.helpers import chestnut_present, chestnut_compiled, chestnut_ready, modeld_pkl_path, load_oob
+from openpilot.selfdrive.modeld.helpers import chestnut_present, chestnut_compiled, modeld_pkl_path, load_oob
+from openpilot.system.hardware.chestnut.readiness import wait_for_chestnut_ready
+from openpilot.selfdrive.modeld.lane_centering_integration import LaneCenteringModelAdapter, update_lane_change_helpers
+from openpilot.selfdrive.modeld.lane_centering import ACTION_SMOOTH_SECONDS
 
 from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
 from openpilot.sunnypilot.modeld_v2.modeld_base import ModelStateBase
@@ -48,7 +51,8 @@ BIG_MODEL_TIMEOUT = 60
 
 
 def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.ModelDataV2.Action,
-                          lat_action_t: float, long_action_t: float, v_ego: float) -> log.ModelDataV2.Action:
+                          lat_action_t: float, long_action_t: float, v_ego: float,
+                          lateral_smooth_seconds: float | None = None) -> log.ModelDataV2.Action:
   if 'action' not in model_output:
     plan = model_output['plan'][0]
     desired_accel = get_accel_from_plan(plan[:,Plan.VELOCITY][:,0],
@@ -66,7 +70,8 @@ def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.
   stop = should_stop(v_ego, desired_accel)
   desired_accel = smooth_value(desired_accel, prev_action.desiredAcceleration, LONG_SMOOTH_SECONDS)
   if v_ego > MIN_LAT_CONTROL_SPEED:
-    desired_curvature = smooth_value(desired_curvature, prev_action.desiredCurvature, LAT_SMOOTH_SECONDS)
+    desired_curvature = smooth_value(desired_curvature, prev_action.desiredCurvature,
+                                    LAT_SMOOTH_SECONDS if lateral_smooth_seconds is None else lateral_smooth_seconds)
   else:
     desired_curvature = prev_action.desiredCurvature
 
@@ -243,16 +248,9 @@ def main(demo=False):
   cloudlog.warning("modeld init")
 
   chestnut_available = chestnut_present() and chestnut_compiled()
-  CHESTNUT = False
-  if chestnut_available:
-    poller = messaging.Poller()
-    sock = messaging.sub_sock("chestnutState", poller=poller, conflate=True)
-    deadline = time.monotonic() + 4. / SERVICE_LIST['deviceState'].frequency
-    while not CHESTNUT and (remaining := deadline - time.monotonic()) > 0.:
-      if not poller.poll(round(remaining * 1000)):
-        break
-      msg = messaging.recv_one_or_none(sock)
-      CHESTNUT = msg is not None and msg.valid and chestnut_ready(msg.chestnutState)
+  CHESTNUT = chestnut_available and wait_for_chestnut_ready(CHESTNUT_USB_PRODUCT)
+  if chestnut_available and not CHESTNUT:
+    cloudlog.warning("Chestnut USB/PCIe readiness check failed, using the small model")
   if CHESTNUT:
     os.environ['HCQDEV_WAIT_TIMEOUT_MS'] = '3000'
   params = Params()
@@ -348,7 +346,7 @@ def main(demo=False):
   # TODO this needs more thought, use .2s extra for now to estimate other delays
   # TODO Move smooth seconds to action function
   long_delay = CP.longitudinalActuatorDelay + LONG_SMOOTH_SECONDS
-  prev_action = log.ModelDataV2.Action()
+  lane_centering = LaneCenteringModelAdapter("absolute")
 
   DH = DesireHelper()
   RELC = RoadEdgeLaneChangeController()
@@ -392,7 +390,7 @@ def main(demo=False):
     frame_id = sm["narrowRoadCameraState"].frameId
     v_ego = max(sm["carState"].vEgo, 0.)
     model.lat_delay = get_lat_delay(params, sm["lateralDelay"].lateralDelay)
-    lat_delay = sm["lateralDelay"].lateralDelay + LAT_SMOOTH_SECONDS
+    lat_delay = model.lat_delay + ACTION_SMOOTH_SECONDS
     if sm.updated["extrinsicsCalibration"] and sm.seen['narrowRoadCameraState'] and sm.seen['deviceState']:
       device_from_calib_euler = np.array(sm["extrinsicsCalibration"].rpyCalib, dtype=np.float32)
       dc = DEVICE_CAMERAS[(str(sm['deviceState'].deviceType), str(sm['narrowRoadCameraState'].sensor))]
@@ -458,20 +456,18 @@ def main(demo=False):
       drivingdata_send = messaging.new_message('drivingModelData')
       posenet_send = messaging.new_message('cameraOdometry')
 
-      action = get_action_from_model(model_output, prev_action, lat_action_t, long_action_t, v_ego)
-      prev_action = action
-      fill_model_msg(modelv2_send, model_output, action,
+      mdv2sp_send = messaging.new_message('modelDataV2SP')
+      update_lane_change_helpers(model_output, sm['carState'], sm['carControl'].latActive, v_ego,
+                                 DH, RELC, mdv2sp_send.modelDataV2SP)
+      selected_model_output, action, _ = lane_centering.update(
+        model_output, get_action_from_model, sm, extrinsics_calibration_seen, DH.lane_change_state,
+        meta_main.timestamp_eof, v_ego, lat_action_t, long_action_t,
+      )
+      fill_model_msg(modelv2_send, selected_model_output, action,
                      publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
                      frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, extrinsics_calibration_seen)
       modelv2_send.modelV2.big = model.chestnut
 
-      desire_state = modelv2_send.modelV2.meta.desireState
-      l_lane_change_prob = desire_state[log.Desire.laneChangeLeft]
-      r_lane_change_prob = desire_state[log.Desire.laneChangeRight]
-      lane_change_prob = l_lane_change_prob + r_lane_change_prob
-      mdv2sp_send = messaging.new_message('modelDataV2SP')
-      left_edge, right_edge = RELC.update_and_fill(modelv2_send.modelV2, mdv2sp_send.modelDataV2SP, v_ego)
-      DH.update(sm['carState'], sm['carControl'].latActive, lane_change_prob, left_edge, right_edge)
       modelv2_send.modelV2.meta.laneChangeState = DH.lane_change_state
       modelv2_send.modelV2.meta.laneChangeDirection = DH.lane_change_direction
       mdv2sp_send.modelDataV2SP.laneTurnDirection = DH.lane_turn_direction

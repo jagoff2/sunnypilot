@@ -17,6 +17,7 @@ from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
 from openpilot.sunnypilot.modeld_v2.modeld_base import ModelStateBase
 from openpilot.sunnypilot.selfdrive.controls.lib.blinker_pause_lateral import BlinkerPauseLateral
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v0 import LatControlTorque as LatControlTorqueV0
+from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_c3x import LatControlTorque as LatControlTorqueC3X
 
 
 class ControlsExt(ModelStateBase):
@@ -39,7 +40,7 @@ class ControlsExt(ModelStateBase):
     torque_versions = self.params.get("TorqueControlTune")
     if not enforce_torque_control:
       if self.CP.lateralTuning.which() == 'torque':
-        return LatControlTorqueV0(self.CP, self.CP_SP, CI, dt)  # FIXME-SP: revert when upstream fixes tuning issues with v1
+        return LatControlTorqueC3X(self.CP, self.CP_SP, CI, dt)
       return lac
 
     if torque_versions == 0.0:  # v0
