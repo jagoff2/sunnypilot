@@ -1,4 +1,4 @@
-"""Adapt the C3X lane trajectory selector to C4 model action heads."""
+"""Use the C3X selected lateral trajectory with C4 longitudinal actions."""
 import logging
 from dataclasses import replace
 from types import SimpleNamespace
@@ -13,6 +13,17 @@ from openpilot.selfdrive.modeld.lane_centering import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _get_lateral_curvature(model_output, previous_curvature, v_ego, lat_action_t):
+  if v_ego > 0.3:
+    plan = model_output['plan'][0]
+    curvature = get_curvature_from_plan(
+      plan[:, Plan.T_FROM_CURRENT_EULER][:, 2], plan[:, Plan.ORIENTATION_RATE][:, 2],
+      ModelConstants.T_IDXS, v_ego, lat_action_t,
+    )
+    return smooth_value(curvature, previous_curvature, ACTION_SMOOTH_SECONDS)
+  return previous_curvature
 
 
 def update_lane_change_helpers(model_output, car_state, lat_active, v_ego, desire_helper, edge_controller, model_data_sp):
@@ -39,12 +50,11 @@ class LaneCenteringModelAdapter:
 
   def update(self, model_output, action_from_model, sm, calibration_seen, lane_change_state,
              timestamp_eof, v_ego, lat_action_t, long_action_t):
-    # Keep the native model's acceleration, stopping rules, and base action
-    # history independent of the selected lateral trajectory.
+    # Preserve native longitudinal action/history. Both lateral histories use
+    # their corresponding plans, as on c3x, including when lane selection abstains.
     raw_base_action = action_from_model(model_output, self.previous_base_action, lat_action_t, long_action_t, v_ego,
                                         lateral_smooth_seconds=0.0)
-    base_curvature = (smooth_value(raw_base_action.desiredCurvature, self.previous_base_action.desiredCurvature, ACTION_SMOOTH_SECONDS)
-                      if v_ego > 0.3 else self.previous_base_action.desiredCurvature)
+    base_curvature = _get_lateral_curvature(model_output, self.previous_base_action.desiredCurvature, v_ego, lat_action_t)
     base_action = log.ModelDataV2.Action(
       desiredCurvature=float(base_curvature), desiredAcceleration=raw_base_action.desiredAcceleration,
       shouldStop=raw_base_action.shouldStop,
@@ -65,28 +75,9 @@ class LaneCenteringModelAdapter:
       lane_change_state != log.LaneChangeState.off,
     )
 
-    curvature = raw_base_action.desiredCurvature
-    if selected_output is not model_output:
-      plan = selected_output['plan'][0]
-      curvature = get_curvature_from_plan(
-        plan[:, Plan.T_FROM_CURRENT_EULER][:, 2], plan[:, Plan.ORIENTATION_RATE][:, 2],
-        ModelConstants.T_IDXS, v_ego, lat_action_t,
-      )
-      base_plan = model_output['plan'][0]
-      base_plan_curvature = get_curvature_from_plan(
-        base_plan[:, Plan.T_FROM_CURRENT_EULER][:, 2], base_plan[:, Plan.ORIENTATION_RATE][:, 2],
-        ModelConstants.T_IDXS, v_ego, lat_action_t,
-      )
-      # The captured selector blends against the base plan. Modern action heads
-      # can disagree with that plan, so retain their contribution as authority
-      # ramps to/from zero instead of switching baselines on the first tick.
-      curvature += (1.0 - status.path_weight) * (raw_base_action.desiredCurvature - base_plan_curvature)
-    if v_ego > 0.3:
-      curvature = smooth_value(curvature, self.previous_selected_action.desiredCurvature, ACTION_SMOOTH_SECONDS)
-    else:
-      curvature = self.previous_selected_action.desiredCurvature
-    # Filter the selected history on every tick, including the final return to
-    # an action head. Returning base_action directly would switch filter states.
+    # Match the action to the same trajectory published for NNLC preview. Keep
+    # one selected filter history through acquisition, release and base-plan fallback.
+    curvature = _get_lateral_curvature(selected_output, self.previous_selected_action.desiredCurvature, v_ego, lat_action_t)
     action = log.ModelDataV2.Action(
       desiredCurvature=float(curvature), desiredAcceleration=base_action.desiredAcceleration,
       shouldStop=base_action.shouldStop,

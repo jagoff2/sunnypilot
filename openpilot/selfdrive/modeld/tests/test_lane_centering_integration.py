@@ -164,7 +164,7 @@ class TestLaneCenteringIntegration(unittest.TestCase):
         self.assertIs(selected, output)
         self.assertEqual(status.authority, 0.0)
 
-  def test_abstention_keeps_native_action_history_and_stop_semantics(self):
+  def test_abstention_keeps_longitudinal_history_and_low_speed_curvature(self):
     for name, native in native_actions():
       with self.subTest(model=name):
         output = model_output()
@@ -181,6 +181,78 @@ class TestLaneCenteringIntegration(unittest.TestCase):
           self.assertEqual(action.desiredCurvature, expected.desiredCurvature)
           previous = expected
 
+  def test_action_heads_cannot_change_lateral_targets_or_selection(self):
+    for name, native in native_actions():
+      for mode in ("absolute", "capped", "off"):
+        with self.subTest(model=name, mode=mode):
+          adapters = [LaneCenteringModelAdapter(mode), LaneCenteringModelAdapter(mode)]
+          inputs = Inputs()
+          phases = ((False, True, False), (True, True, False), (True, False, False),
+                    (True, True, False), (True, True, True), (True, True, False))
+          for active, boundaries_valid, blinker in phases:
+            inputs['carControl'].latActive = active
+            inputs['carState'].leftBlinker = blinker
+            for _ in range(45):
+              results = []
+              for sign, adapter in zip((-1, 1), adapters, strict=True):
+                output = model_output()
+                output['action'] = np.array([[sign * 2.4, -1.0]], dtype=np.float32)
+                if not boundaries_valid:
+                  output['lane_lines_prob'][:] = 0.0
+                results.append(self.run_frames(adapter, output, native, inputs))
+              left, right = results
+              np.testing.assert_array_equal(left[0]['plan'], right[0]['plan'])
+              self.assertEqual(left[1].desiredCurvature, right[1].desiredCurvature)
+              self.assertEqual(adapters[0].previous_base_action.desiredCurvature, adapters[1].previous_base_action.desiredCurvature)
+              self.assertEqual(left[2], right[2])
+
+  def test_low_speed_holds_each_history_then_resumes_from_selected_plan(self):
+    for name, native in native_actions():
+      for mode, active in (("off", True), ("absolute", False)):
+        with self.subTest(model=name, mode=mode, active=active):
+          adapter, inputs, output = LaneCenteringModelAdapter(mode), Inputs(), model_output()
+          inputs['carControl'].latActive = active
+          output['action'] = np.array([[2.4, -1.0]], dtype=np.float32)
+          adapter.previous_base_action = log.ModelDataV2.Action(desiredCurvature=-0.003)
+          adapter.previous_selected_action = log.ModelDataV2.Action(desiredCurvature=0.004)
+          for frame, speed in enumerate((0.0, 0.299, 0.3, float('nan'), 0.301), 1):
+            selected, action, _ = adapter.update(output, native, inputs, True, log.LaneChangeState.off,
+                                                 frame * 50_000_000, speed, 0.475, 0.475)
+            self.assertIs(selected, output)
+            if speed <= 0.3 or np.isnan(speed):
+              self.assertAlmostEqual(action.desiredCurvature, 0.004, places=8)
+              self.assertAlmostEqual(adapter.previous_base_action.desiredCurvature, -0.003, places=8)
+            else:
+              # This base plan is straight, irrespective of the nonzero action head.
+              self.assertAlmostEqual(action.desiredCurvature, smooth_value(0.0, 0.004, ACTION_SMOOTH_SECONDS), places=8)
+              self.assertAlmostEqual(adapter.previous_base_action.desiredCurvature, smooth_value(0.0, -0.003, ACTION_SMOOTH_SECONDS), places=8)
+
+  def test_abstention_follows_curved_plan_despite_conflicting_heads(self):
+    for name, native in native_actions():
+      for head in ("action", "desired_curvature", "planplus"):
+        for sign in (-1, 1):
+          with self.subTest(model=name, head=head, sign=sign):
+            adapter, inputs, output = LaneCenteringModelAdapter("off"), Inputs(), model_output()
+            curvature = sign * 0.004
+            output['plan'][0, :, Plan.T_FROM_CURRENT_EULER.start + 2] = curvature * 20.0 * np.asarray(ModelConstants.T_IDXS)
+            output['plan'][0, :, Plan.ORIENTATION_RATE.start + 2] = curvature * 20.0
+            output['plan'][0, :, Plan.ACCELERATION.start + 1] = curvature * 400.0
+            if head == "action":
+              output[head] = np.array([[-sign * 2.4, -1.0]], dtype=np.float32)
+            elif head == "desired_curvature":
+              output[head] = np.array([[-sign * 0.006]], dtype=np.float32)
+            else:
+              output[head] = copy.deepcopy(output['plan'])
+              output[head][0, :, Plan.T_FROM_CURRENT_EULER.start + 2] *= -2.0
+              output[head][0, :, Plan.ORIENTATION_RATE.start + 2] *= -2.0
+            expected_long = native(output, adapter.previous_base_action, 0.475, 0.475, 20.0)
+            selected, action, _ = self.run_frames(adapter, output, native, inputs)
+            self.assertIs(selected, output)
+            self.assertAlmostEqual(action.desiredCurvature, smooth_value(curvature, 0.0, ACTION_SMOOTH_SECONDS), places=8)
+            self.assertAlmostEqual(adapter.previous_base_action.desiredCurvature, action.desiredCurvature, places=8)
+            self.assertEqual(action.desiredAcceleration, expected_long.desiredAcceleration)
+            self.assertEqual(action.shouldStop, expected_long.shouldStop)
+
   def test_exit_and_reacquisition_keep_one_selected_filter_history(self):
     for name, native in native_actions():
       for exit_kind in ("ordinary", "hard"):
@@ -193,35 +265,28 @@ class TestLaneCenteringIntegration(unittest.TestCase):
           if exit_kind == "hard":
             inputs['carState'].leftBlinker = True
           saw_selected_exit = False
-          saw_native_fallback = False
+          saw_base_plan_fallback = False
           for _ in range(45):
             previous = adapter.previous_selected_action.desiredCurvature
             selected, action, status = self.run_frames(adapter, dropout, native, inputs)
             if selected is dropout:
-              raw = float(dropout['action'][0, 0]) / 400.0
-              saw_native_fallback = True
+              saw_base_plan_fallback = True
             else:
               saw_selected_exit = True
-              plan = selected['plan'][0]
-              raw = get_curvature_from_plan(plan[:, Plan.T_FROM_CURRENT_EULER][:, 2],
-                                            plan[:, Plan.ORIENTATION_RATE][:, 2], ModelConstants.T_IDXS, 20.0, 0.475)
-              # This fixture's base plan is straight; the action head requests a turn.
-              raw += (1.0 - status.path_weight) * float(dropout['action'][0, 0]) / 400.0
+            plan = selected['plan'][0]
+            raw = get_curvature_from_plan(plan[:, Plan.T_FROM_CURRENT_EULER][:, 2],
+                                          plan[:, Plan.ORIENTATION_RATE][:, 2], ModelConstants.T_IDXS, 20.0, 0.475)
             self.assertAlmostEqual(action.desiredCurvature, smooth_value(raw, previous, ACTION_SMOOTH_SECONDS), places=8)
           self.assertTrue(saw_selected_exit)
-          self.assertTrue(saw_native_fallback)
+          self.assertTrue(saw_base_plan_fallback)
           self.assertEqual(status.authority, 0.0)
           inputs['carState'].leftBlinker = False
           for _ in range(45):
             previous = adapter.previous_selected_action.desiredCurvature
             selected, action, status = self.run_frames(adapter, output, native, inputs)
-            if selected is output:
-              raw = float(output['action'][0, 0]) / 400.0
-            else:
-              plan = selected['plan'][0]
-              raw = get_curvature_from_plan(plan[:, Plan.T_FROM_CURRENT_EULER][:, 2],
-                                            plan[:, Plan.ORIENTATION_RATE][:, 2], ModelConstants.T_IDXS, 20.0, 0.475)
-              raw += (1.0 - status.path_weight) * float(output['action'][0, 0]) / 400.0
+            plan = selected['plan'][0]
+            raw = get_curvature_from_plan(plan[:, Plan.T_FROM_CURRENT_EULER][:, 2],
+                                          plan[:, Plan.ORIENTATION_RATE][:, 2], ModelConstants.T_IDXS, 20.0, 0.475)
             self.assertAlmostEqual(action.desiredCurvature, smooth_value(raw, previous, ACTION_SMOOTH_SECONDS), places=8)
           self.assertEqual(status.authority, 1.0)
 
