@@ -6,7 +6,7 @@ from openpilot.sunnypilot.models.helpers import get_active_bundle
 ModelBundle = custom.ModelManagerSP.ModelBundle
 
 
-def load_meta_constants():
+def load_meta_constants(chestnut: bool | None = None):
   """
   Determines and loads the appropriate meta model class based on the metadata provided. The function checks
   specific keys and conditions within the provided metadata dictionary to identify the corresponding meta
@@ -20,7 +20,7 @@ def load_meta_constants():
       based on the conditions and metadata provided.
   :rtype: type
   """
-  if (bundle := get_active_bundle()) and bundle.is20hz:
+  if (bundle := get_active_bundle(chestnut=chestnut)) and bundle.is20hz:
     return Meta20hz
 
   return Meta  # Default

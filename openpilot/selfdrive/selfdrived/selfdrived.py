@@ -25,6 +25,7 @@ from openpilot.selfdrive.selfdrived.alertmanager import AlertManager, set_offroa
 
 from openpilot.common.version import get_build_metadata
 from openpilot.common.hardware import HARDWARE
+from openpilot.system.hardware.chestnut.availability import ModelAvailability
 
 from openpilot.sunnypilot.mads.mads import ModularAssistiveDrivingSystem
 from openpilot.sunnypilot import get_sanitize_int_param
@@ -82,10 +83,7 @@ class SelfdriveD(CruiseHelper):
     self.calibrated_pose: Pose | None = None
     self.excessive_actuation_check = ExcessiveActuationCheck()
     self.excessive_actuation = self.params.get("Offroad_ExcessiveActuation") is not None
-    self.big_model_loading = False
-    self.big_model_active = False
-    self.big_model_failed = False
-    self.big_model_ready_t = 0.
+    self.model_availability = ModelAvailability()
 
     # Setup sockets
     self.pm = messaging.PubMaster(['selfdriveState', 'onroadEvents'] + ['selfdriveStateSP', 'onroadEventsSP'])
@@ -185,6 +183,20 @@ class SelfdriveD(CruiseHelper):
     CruiseHelper.__init__(self, self.CP)
     self.button_state_tracker = ButtonStateTracker()
 
+  def update_chestnut_events(self):
+    alerts = self.model_availability.update(
+      now=time.monotonic(),
+      healthy=self.sm.seen['modelV2'] and self.sm.all_checks(['modelV2']),
+      big=self.sm['modelV2'].big,
+      loading=self.params.get_bool("ChestnutLoading"),
+    )
+    if alerts.loading:
+      self.events.add(EventName.bigModelLoading)
+    if alerts.failed:
+      self.events.add(EventName.bigModelFailed)
+    if alerts.ready:
+      self.events_sp.add(custom.OnroadEventSP.EventName.bigModelReady)
+
   def update_events(self, CS):
     """Compute onroadEvents from carState"""
 
@@ -195,27 +207,7 @@ class SelfdriveD(CruiseHelper):
       self.events.add(EventName.joystickDebug)
       self.startup_event = None
 
-    loading = self.params.get_bool("ChestnutLoading")
-    if self.big_model_loading and not loading:
-      self.big_model_ready_t = time.monotonic()
-      self.events_sp.add(custom.OnroadEventSP.EventName.bigModelReady)
-    self.big_model_loading = loading
-    if self.big_model_loading:
-      self.events.add(EventName.bigModelLoading)
-
-    big_active = self.params.get("ChestnutActive")
-    chestnut_present = self.sm['deviceState'].chestnutPresent
-    model_unavailable = big_active is True and self.sm.seen['modelV2'] and not self.sm.alive['modelV2']
-    big_failed = big_active is False or model_unavailable or (self.big_model_active and not chestnut_present)
-    if big_failed and not self.big_model_failed:
-      self.events.add(EventName.bigModelFailed)
-    self.big_model_failed = big_failed
-
-    # soft disable if the big model fails
-    if big_active:
-      self.big_model_active = True
-    if not self.enabled and not model_unavailable:
-      self.big_model_active = False
+    self.update_chestnut_events()
 
     if self.sm.recv_frame['lateralManeuverPlan'] > 0:
       self.events.add(EventName.lateralManeuver)
@@ -398,9 +390,6 @@ class SelfdriveD(CruiseHelper):
     # All events here should at least have NO_ENTRY and SOFT_DISABLE.
     num_events = len(self.events)
 
-    if self.big_model_active and big_failed:
-      self.events.add(EventName.bigModelFailed)
-
     not_running = {p.name for p in self.sm['managerState'].processes if not p.running and p.shouldBeRunning}
     if self.sm.recv_frame['managerState'] and len(not_running):
       if not_running != self.not_running_prev:
@@ -431,9 +420,8 @@ class SelfdriveD(CruiseHelper):
     # generic catch-all. ideally, a more specific event should be added above instead
     has_disable_events = self.events.contains(ET.NO_ENTRY) and (self.events.contains(ET.SOFT_DISABLE) or self.events.contains(ET.IMMEDIATE_DISABLE))
     no_system_errors = (not has_disable_events) or (len(self.events) == num_events)
-    warmup_sec = 5.
-    big_model_settling = self.big_model_loading or time.monotonic() < self.big_model_ready_t + warmup_sec
-    if not self.sm.all_checks() and no_system_errors and not big_model_settling:  # the load holds modelV2 and friends back on purpose
+    # Background GPU recovery must not suppress ordinary model/comm checks.
+    if not self.sm.all_checks() and no_system_errors:
       if not self.sm.all_alive():
         self.events.add(EventName.commIssue)
       elif not self.sm.all_freq_ok():
@@ -452,7 +440,7 @@ class SelfdriveD(CruiseHelper):
     else:
       self.logged_comm_issue = None
 
-    if not self.CP.notCar and not big_model_settling:  # localization has nothing to work with during the load
+    if not self.CP.notCar:
       if not self.sm['deviceMotion'].posenetOK:
         self.events.add(EventName.posenetInvalid)
       if not self.sm['deviceMotion'].inputsOK:

@@ -15,6 +15,15 @@ def is_chestnut_usb_id(vendor_id: int, product_id: int, include_bootloader: bool
   return (vendor_id, product_id) in ids
 
 
+def chestnut_usb_identity(devices) -> tuple[int, int] | None:
+  docks = [d for d in devices if is_chestnut_usb_id(d.vendorId, d.productId, include_bootloader=True)]
+  if len(docks) == 1:
+    dock = docks[0]
+    if is_chestnut_usb_id(dock.vendorId, dock.productId) and dock.product == CHESTNUT_USB_PRODUCT and dock.speedMbps >= 5000:
+      return dock.busnum, dock.devnum
+  return None
+
+
 def get_usb_topology() -> set[str]:
   try:
     return set(os.listdir(USB_DEVICES_PATH))

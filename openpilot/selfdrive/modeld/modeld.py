@@ -7,14 +7,12 @@ os.environ['GMMU'] = '0' # for chestnut fast loading, noop for qcom
 from tinygrad.device import Device
 import usb1
 import struct
-import threading
 import time
 import numpy as np
 import openpilot.cereal.messaging as messaging
 from openpilot.cereal import log
 from opendbc.car.structs import car
 from openpilot.cereal.messaging import PubMaster, SubMaster
-from openpilot.cereal.services import SERVICE_LIST
 from openpilot.cereal.visionipc import VisionStreamType
 from msgq.visionipc import VisionIpcClient, VisionBuf
 from opendbc.car.car_helpers import get_demo_car_params
@@ -31,10 +29,10 @@ from openpilot.selfdrive.modeld.parse_model_outputs import Parser
 from openpilot.selfdrive.modeld.compile_modeld import make_input_queues, nv12_copy_size, MODELD_INPUTS
 from openpilot.selfdrive.modeld.fill_model_msg import fill_model_msg, fill_driving_model_data, fill_pose_msg, PublishState
 from openpilot.common.file_chunker import open_file_chunked
-from openpilot.common.hardware.usb import CHESTNUT_USB_IDS, CHESTNUT_USB_PRODUCT
+from openpilot.common.hardware.usb import CHESTNUT_USB_IDS, chestnut_usb_identity
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
-from openpilot.selfdrive.modeld.helpers import chestnut_present, chestnut_compiled, modeld_pkl_path, load_oob
-from openpilot.system.hardware.chestnut.readiness import wait_for_chestnut_ready
+from openpilot.selfdrive.modeld.helpers import chestnut_compiled, modeld_pkl_path, load_oob
+from openpilot.system.hardware.chestnut.inference import RecoveringModel
 from openpilot.selfdrive.modeld.lane_centering_integration import LaneCenteringModelAdapter, update_lane_change_helpers
 from openpilot.selfdrive.modeld.lane_centering import ACTION_SMOOTH_SECONDS
 
@@ -47,7 +45,6 @@ SEND_RAW_PRED = os.getenv('SEND_RAW_PRED')
 LAT_SMOOTH_SECONDS = 0.0
 LONG_SMOOTH_SECONDS = 0.3
 MIN_LAT_CONTROL_SPEED = 0.3
-BIG_MODEL_TIMEOUT = 60
 
 
 def get_action_from_model(model_output: dict[str, np.ndarray], prev_action: log.ModelDataV2.Action,
@@ -247,18 +244,9 @@ class ModelState(ModelStateBase):
 def main(demo=False):
   cloudlog.warning("modeld init")
 
-  chestnut_available = chestnut_present() and chestnut_compiled()
-  CHESTNUT = chestnut_available and wait_for_chestnut_ready(CHESTNUT_USB_PRODUCT)
-  if chestnut_available and not CHESTNUT:
-    cloudlog.warning("Chestnut USB/PCIe readiness check failed, using the small model")
-  if CHESTNUT:
-    os.environ['HCQDEV_WAIT_TIMEOUT_MS'] = '3000'
   params = Params()
-  params.put_bool("ChestnutLoading", CHESTNUT)
-  if chestnut_available and not CHESTNUT:
-    params.put_bool("ChestnutActive", False)
-  else:
-    params.remove("ChestnutActive")
+  params.put_bool("ChestnutLoading", False)
+  params.put_bool("ChestnutActive", False)
 
   config_realtime_process(7, 54)
 
@@ -287,42 +275,18 @@ def main(demo=False):
 
   st = time.monotonic()
   cloudlog.warning("loading model")
-  model = None
-  if CHESTNUT:
-    big_model = None
-    def load_big():
-      nonlocal big_model
-      try:
-        m = ModelState(vipc_client_main.width, vipc_client_main.height, True)
-        m.warmup()
-        big_model = m
-      except Exception:
-        cloudlog.exception("big model load failed")
-    loader = threading.Thread(target=load_big, daemon=True)
-    loader.start()
-    loader.join(BIG_MODEL_TIMEOUT)
-    model = big_model
-    if model is None:
-      params.put_bool("ChestnutModelError", True)
-    params.put_bool("ChestnutActive", model is not None)
-    if model is not None:
-      params.remove("ChestnutModelError")
-
-  small_model = ModelState(vipc_client_main.width, vipc_client_main.height, False) if model is None or CHESTNUT else None
-  if model is None:
-    model = small_model
-  params.put_bool("ChestnutLoading", False)
-  assert model is not None
+  small_model = ModelState(vipc_client_main.width, vipc_client_main.height, False)
+  model = RecoveringModel(small_model, 'stock', vipc_client_main.width, vipc_client_main.height,
+                          get_nv12_info(vipc_client_main.width, vipc_client_main.height)[3], params, chestnut_compiled)
   cloudlog.warning(f"models loaded in {time.monotonic() - st:.1f}s, modeld starting")
 
   # messaging
-  pub_socks = ["modelV2", "drivingModelData", "cameraOdometry", "modelDataV2SP"] + (["chestnutState"] if CHESTNUT else [])
+  pub_socks = ["modelV2", "drivingModelData", "cameraOdometry", "modelDataV2SP"]
   pm = PubMaster(pub_socks)
   sm = SubMaster(["deviceState", "carState", "narrowRoadCameraState", "extrinsicsCalibration", "driverMonitoringState", "carControl", "lateralDelay"])
 
   publish_state = PublishState()
   params = Params()
-  chestnut_state = ChestnutState(pm, model.chestnut) if CHESTNUT else None
 
   # setup filter to track dropped frames
   frame_dropped_filter = FirstOrderFilter(0., 10., 1. / ModelConstants.MODEL_RUN_FREQ)
@@ -385,6 +349,7 @@ def main(demo=False):
       meta_extra = meta_main
 
     sm.update(0)
+    model.observe(chestnut_usb_identity(sm['deviceState'].usbState.devices) if sm.all_checks(['deviceState']) else None)
     desire = DH.desire
     is_rhd = sm["driverMonitoringState"].isRHD
     frame_id = sm["narrowRoadCameraState"].frameId
@@ -431,23 +396,7 @@ def main(demo=False):
     }
 
     mt1 = time.perf_counter()
-    try:
-      send_chestnut = (chestnut_state is not None and
-                       run_count % round(ModelConstants.MODEL_RUN_FREQ / SERVICE_LIST['chestnutState'].frequency) == 0)
-      model_output = model.run(bufs, transforms, inputs, chestnut_state.send if send_chestnut else None)
-    except Exception:
-      if not params.get_bool("ChestnutActive"):
-        raise
-      # fallback to small model
-      cloudlog.exception("big model failed, fall back to small")
-      params.put_bool("ChestnutModelError", True)
-      params.put_bool("ChestnutActive", False)
-      assert small_model is not None
-      model = small_model
-      if chestnut_state is not None:
-        chestnut_state.big = False
-      run_count = 0
-      model_output = None
+    model_output = model.run(bufs, transforms, inputs)
     mt2 = time.perf_counter()
     model_execution_time = mt2 - mt1
 

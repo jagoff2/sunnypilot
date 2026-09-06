@@ -51,6 +51,17 @@ class ChestnutStatus:
 
     if not offroad and self.usb_seen and not firmware_ok:
       self.usb_failed = True
+    self.usb_seen |= firmware_ok
+
+    # A new successful model load can recover in the same drive. Keep latched
+    # faults until both the runner and fresh bridge telemetry confirm recovery.
+    if firmware_ok and model_active and not model_loading and state is not None and chestnut_powered(state) and state.pcieLtssm == CHESTNUT_PCIE_READY:
+      self.usb_failed = False
+      self.pcie_failed = False
+      self.power_lost = False
+      self.power_unavailable = False
+      self.power_restored = False
+      self.link_failures = 0
 
     if not offroad and state is not None:
       powered = chestnut_powered(state)
@@ -90,9 +101,9 @@ class ChestnutStatus:
     set_alert("Offroad_ChestnutOverheated", self.overheated, f"{state.tempC:.0f} °C" if state is not None else None)
     set_alert("Offroad_ChestnutUsbSlow", slow_usb, f"{devices[0]['speedMbps']} Mbps" if slow_usb else None)
     if self.power_lost:
-      pcie_alert = ("Chestnut power restored. 12V is stable again, cycle ignition." if self.power_restored else
-                    "Chestnut power disconnected. Check 12V connection, then cycle ignition." if self.power_unavailable else
-                    "Chestnut power lost. Possibly caused by an engine-crank voltage drop. Check 12V connection, then cycle ignition.")
+      pcie_alert = ("Chestnut power restored. GPU recovery will retry automatically." if self.power_restored else
+                    "Chestnut power disconnected. Check the 12V connection. GPU recovery will retry automatically." if self.power_unavailable else
+                    "Chestnut power lost, possibly during engine crank. Check the 12V connection. GPU recovery will retry automatically.")
     else:
       pcie_alert = "Chestnut GPU unavailable. PCIe link is not up. Check the GPU is securely seated."
     set_alert("Offroad_ChestnutPcieUnavailable", self.pcie_failed, pcie_alert)

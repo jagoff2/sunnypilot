@@ -11,7 +11,7 @@ import pytest
 from openpilot.system.hardware.chestnut import flash, readiness
 
 
-PRODUCT = "custom ed4e39b7-CLEAN"
+PRODUCT = "custom 21b775b9-CLEAN"
 ROOT = Path(__file__).resolve().parents[4]
 
 
@@ -170,35 +170,25 @@ def startup_function(path, namespace):
   # The first top-level while is the camera connection loop, after dock selection.
   main = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.FunctionDef) and n.name == 'main')
   camera_loop = next(i for i, n in enumerate(main.body) if isinstance(n, ast.While))
-  main.body = main.body[:camera_loop] + [ast.Return(value=ast.Name(id='CHESTNUT', ctx=ast.Load()))]
+  main.body = main.body[:camera_loop] + [ast.Return(value=ast.Constant(value=None))]
   module = ast.fix_missing_locations(ast.Module(body=[main], type_ignores=[]))
   exec(compile(module, str(path), 'exec'), namespace)
   return namespace['main']
 
 
 @pytest.mark.parametrize('path', ['openpilot/selfdrive/modeld/modeld.py', 'openpilot/sunnypilot/modeld_v2/modeld.py'])
-@pytest.mark.parametrize('fault', [False, True])
-def test_model_runners_select_dock_directly(monkeypatch, bridge, clock, path, fault):
-  monkeypatch.setenv('CHESTNUT_DOCK', 'asm2464')
-  monkeypatch.setenv('HCQDEV_WAIT_TIMEOUT_MS', '1000')
-  bridge.fault = fault
+def test_model_runners_start_fallback_without_waiting_for_dock(bridge, path):
   params = Mock()
-  namespace = {'os': os, 'cloudlog': Mock(), 'sentry': Mock(), 'setproctitle': Mock(), 'PROCESS_NAME': 'modeld',
-               'config_realtime_process': Mock(), 'chestnut_present': lambda: True, 'chestnut_compiled': lambda: True,
-               'CHESTNUT_USB_PRODUCT': PRODUCT, 'wait_for_chestnut_ready': readiness.wait_for_chestnut_ready, 'Params': lambda: params}
-  assert startup_function(ROOT / path, namespace)() == (not fault)
-  params.put_bool.assert_any_call('ChestnutLoading', not fault)
-  if fault:
-    params.put_bool.assert_any_call('ChestnutActive', False)
-
-
-def test_uncompiled_stock_model_does_not_probe_usb(monkeypatch, bridge):
-  monkeypatch.setenv('CHESTNUT_DOCK', 'asm2464')
-  namespace = {'os': os, 'cloudlog': Mock(), 'config_realtime_process': Mock(), 'chestnut_present': lambda: True,
-               'chestnut_compiled': lambda: False, 'CHESTNUT_USB_PRODUCT': PRODUCT,
-               'wait_for_chestnut_ready': readiness.wait_for_chestnut_ready, 'Params': Mock()}
-  assert not startup_function(ROOT / 'openpilot/selfdrive/modeld/modeld.py', namespace)()
+  namespace = {'cloudlog': Mock(), 'sentry': Mock(), 'setproctitle': Mock(), 'PROCESS_NAME': 'modeld',
+               'config_realtime_process': Mock(), 'Params': lambda: params}
+  startup_function(ROOT / path, namespace)()
   assert not bridge.transfers
+  params.put_bool.assert_any_call('ChestnutLoading', False)
+  params.put_bool.assert_any_call('ChestnutActive', False)
+
+
+
+
 
 
 @pytest.fixture
@@ -262,3 +252,23 @@ def test_diy_status_retains_usb_disconnect_alert(monkeypatch, dock_status):
   dock_status.devices.clear()
   dock_status.update()
   assert dock_status.alerts['Offroad_ChestnutNotDetected'][0]
+
+
+def test_diy_status_clears_fault_only_after_model_and_link_recover(monkeypatch, dock_status):
+  monkeypatch.setenv('CHESTNUT_DOCK', 'asm2464')
+  dock_status.update(loading=True, active=None)
+  dock_status.update()
+  devices = dock_status.devices[:]
+  dock_status.devices.clear()
+  dock_status.update(active=False)
+  assert dock_status.alerts['Offroad_ChestnutNotDetected'][0]
+  dock_status.devices.extend(devices)
+  dock_status.update(loading=True, active=False)
+  assert dock_status.alerts['Offroad_ChestnutNotDetected'][0]
+  dock_status.state.pcieLtssm = 0
+  dock_status.update(active=True)
+  assert dock_status.alerts['Offroad_ChestnutNotDetected'][0]
+  dock_status.state.pcieLtssm = 0x78
+  dock_status.update(active=True)
+  assert not dock_status.alerts['Offroad_ChestnutNotDetected'][0]
+  assert not dock_status.alerts['Offroad_ChestnutPcieUnavailable'][0]

@@ -234,8 +234,9 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   },
 
   EventName.bigModelFailed: {
+    ET.NO_ENTRY: NoEntryAlert("Driving Model Unavailable"),
     ET.SOFT_DISABLE: soft_disable_alert("Big Model Failed"),
-    ET.PERMANENT: NormalPermanentAlert("Big Model Failed ", "Restart the car to retry,\nsmall model is still available", duration=20.),
+    ET.PERMANENT: NormalPermanentAlert("Driving Model Unavailable", "Waiting for healthy model output"),
   },
 
   EventName.lateralManeuver: {

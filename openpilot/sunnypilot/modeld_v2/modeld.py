@@ -10,19 +10,17 @@ from collections.abc import Callable
 import os
 os.environ['GMMU'] = '0'
 import numpy as np
-import threading
 import time
 from setproctitle import setproctitle
 from tinygrad.tensor import Tensor
 
 import openpilot.cereal.messaging as messaging
 from openpilot.common.hardware import COMMA_HARDWARE
-from openpilot.selfdrive.modeld.helpers import chestnut_present, load_oob
-from openpilot.common.hardware.usb import CHESTNUT_USB_PRODUCT
-from openpilot.system.hardware.chestnut.readiness import wait_for_chestnut_ready
+from openpilot.selfdrive.modeld.helpers import load_oob
+from openpilot.common.hardware.usb import chestnut_usb_identity
+from openpilot.system.hardware.chestnut.inference import RecoveringModel
 from openpilot.cereal import log
 from opendbc.car.structs import car
-from openpilot.cereal.services import SERVICE_LIST
 from openpilot.cereal.messaging import PubMaster, SubMaster
 from openpilot.cereal.visionipc import VisionStreamType
 from msgq.visionipc import VisionIpcClient, VisionBuf
@@ -38,7 +36,6 @@ from openpilot.system import sentry
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
 from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, smooth_value
-from openpilot.selfdrive.modeld.modeld import ChestnutState
 from openpilot.selfdrive.modeld.lane_centering_integration import LaneCenteringModelAdapter, update_lane_change_helpers
 from openpilot.selfdrive.modeld.lane_centering import ACTION_SMOOTH_SECONDS
 
@@ -53,7 +50,6 @@ from openpilot.sunnypilot.models.helpers import get_active_bundle
 from openpilot.sunnypilot.selfdrive.controls.lib.relc import RoadEdgeLaneChangeController
 
 PROCESS_NAME = "openpilot.selfdrive.modeld.modeld_tinygrad"
-BIG_MODEL_TIMEOUT = 60
 
 
 def _pkl_exists(path):
@@ -317,19 +313,9 @@ def main(demo=False):
   setproctitle(PROCESS_NAME)
   config_realtime_process(7, 54)
 
-  chestnut_available = chestnut_present()
-  CHESTNUT = chestnut_available and wait_for_chestnut_ready(CHESTNUT_USB_PRODUCT)
-  if chestnut_available and not CHESTNUT:
-    cloudlog.warning("Chestnut USB/PCIe readiness check failed, using the small model")
-  if CHESTNUT:
-    os.environ['HCQDEV_WAIT_TIMEOUT_MS'] = '3000'
-
   params = Params()
-  params.put_bool("ChestnutLoading", CHESTNUT)
-  if chestnut_available and not CHESTNUT:
-    params.put_bool("ChestnutActive", False)
-  else:
-    params.remove("ChestnutActive")
+  params.put_bool("ChestnutLoading", False)
+  params.put_bool("ChestnutActive", False)
 
   # visionipc clients
   while True:
@@ -357,37 +343,18 @@ def main(demo=False):
   cloudlog.warning("loading model")
   st = time.monotonic()
 
-  model = None
-  if CHESTNUT:
-    big_model = None
-    def load_big():
-      nonlocal big_model
-      try:
-        m = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, chestnut=True)
-        m.warmup()
-        big_model = m
-      except Exception:
-        cloudlog.exception("chestnut load failed")
-    loader = threading.Thread(target=load_big, daemon=True)
-    loader.start()
-    loader.join(BIG_MODEL_TIMEOUT)
-    model = big_model
-    params.put_bool("ChestnutActive", model is not None)
-
-  small_model = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, chestnut=False) if model is None or CHESTNUT else None
-  if model is None:
-    model = small_model
-  params.put_bool("ChestnutLoading", False)
-  assert model is not None
+  small_model = ModelState(cam_w=vipc_client_main.width, cam_h=vipc_client_main.height, chestnut=False)
+  model = RecoveringModel(small_model, 'custom', vipc_client_main.width, vipc_client_main.height,
+                          get_nv12_info(vipc_client_main.width, vipc_client_main.height)[3], params,
+                          lambda: _find_driving_pkl(get_active_bundle(chestnut=True)) is not None)
   cloudlog.warning(f"models loaded in {time.monotonic() - st:.1f}s, modeld starting")
 
   # messaging
-  pub_socks = ["modelV2", "drivingModelData", "cameraOdometry", "modelDataV2SP"] + (["chestnutState"] if CHESTNUT else [])
+  pub_socks = ["modelV2", "drivingModelData", "cameraOdometry", "modelDataV2SP"]
   pm = PubMaster(pub_socks)
   sm = SubMaster(["deviceState", "carState", "narrowRoadCameraState", "extrinsicsCalibration", "driverMonitoringState", "carControl", "lateralDelay"])
 
   publish_state = PublishState()
-  chestnut_state = ChestnutState(pm, model.chestnut) if CHESTNUT else None
 
   # setup filter to track dropped frames
   frame_dropped_filter = FirstOrderFilter(0., 10., 1. / model.constants.MODEL_FREQ)
@@ -415,7 +382,7 @@ def main(demo=False):
   lane_centering = LaneCenteringModelAdapter("absolute")
 
   DH = DesireHelper()
-  meta_constants = load_meta_constants()
+  meta_constants = {chestnut: load_meta_constants(chestnut=chestnut) for chestnut in (False, True)}
   RELC = RoadEdgeLaneChangeController()
 
   while True:
@@ -452,6 +419,7 @@ def main(demo=False):
       meta_extra = meta_main
 
     sm.update(0)
+    model.observe(chestnut_usb_identity(sm['deviceState'].usbState.devices) if sm.all_checks(['deviceState']) else None)
     desire = DH.desire
     is_rhd = sm["driverMonitoringState"].isRHD
     frame_id = sm["narrowRoadCameraState"].frameId
@@ -501,30 +469,12 @@ def main(demo=False):
     inputs:dict[str, np.ndarray] = {
       model.desire_key: vec_desire,
       'traffic_convention': traffic_convention,
+      'lateral_control_params': np.array([v_ego, lat_delay], dtype=np.float32),
+      'action_t': np.array([lat_action_t, long_action_t], dtype=np.float32),
     }
 
-    if 'lateral_control_params' in model.numpy_inputs:
-      inputs['lateral_control_params'] = np.array([v_ego, lat_delay], dtype=np.float32)
-
-    if 'action_t' in model.numpy_inputs:
-      inputs['action_t'] = np.array([lat_action_t, long_action_t], dtype=np.float32)
-
     mt1 = time.perf_counter()
-    try:
-      send_chestnut = (chestnut_state is not None and
-                       run_count % round(model.constants.MODEL_FREQ / SERVICE_LIST['chestnutState'].frequency) == 0)
-      model_output = model.run(bufs, transforms, inputs, prepare_only, chestnut_state.send if send_chestnut else None)
-    except Exception:
-      if not params.get_bool("ChestnutActive"):
-        raise
-      cloudlog.exception("chestnut failed, falling back to small")
-      params.put_bool("ChestnutActive", False)
-      assert small_model is not None
-      model = small_model
-      if chestnut_state is not None:
-        chestnut_state.big = False
-      run_count = 0
-      model_output = None
+    model_output = model.run(bufs, transforms, inputs, prepare_only)
     mt2 = time.perf_counter()
     model_execution_time = mt2 - mt1
 
@@ -542,7 +492,7 @@ def main(demo=False):
       )
       fill_model_msg(drivingdata_send, modelv2_send, selected_model_output, action,
                      publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
-                     frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, live_calib_seen, meta_constants)
+                     frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, live_calib_seen, meta_constants[model.chestnut])
       modelv2_send.modelV2.big = model.chestnut
 
       modelv2_send.modelV2.meta.laneChangeState = DH.lane_change_state

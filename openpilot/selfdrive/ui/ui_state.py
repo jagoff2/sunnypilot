@@ -219,6 +219,7 @@ class UIState(UIStateSP):
 
   def _update_chestnut_state(self) -> None:
     detected = self.sm["deviceState"].chestnutPresent
+    self.chestnut_present |= detected
     if not self.started:
       self.chestnut_present = detected
       self.chestnut_state = (ChestnutState.READY if detected and self.chestnut_compiled else
@@ -230,11 +231,11 @@ class UIState(UIStateSP):
       self.chestnut_state = ChestnutState.DISCONNECTED
     elif not self.chestnut_compiled:
       self.chestnut_state = ChestnutState.UNCOMPILED
-    elif self.chestnut_state == ChestnutState.FAILED or not detected or (model_seen and (not self.sm.alive["modelV2"] or not self.sm["modelV2"].big)):
+    elif not detected:
       self.chestnut_state = ChestnutState.FAILED
     elif self.chestnut_loading or not model_seen:
       self.chestnut_state = ChestnutState.LOADING
-    elif self.chestnut_active is False:
+    elif not self.sm.alive["modelV2"] or not self.sm["modelV2"].big or self.chestnut_active is False:
       self.chestnut_state = ChestnutState.FAILED
     else:
       self.chestnut_state = ChestnutState.ACTIVE
