@@ -9,6 +9,8 @@ import math
 import numpy as np
 
 from opendbc.car.lateral import get_friction
+from opendbc.sunnypilot.car.interfaces import LatControlInputs
+from opendbc.sunnypilot.car.lateral_ext import get_friction as get_friction_in_torque_space
 from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
 from openpilot.selfdrive.modeld.constants import ModelConstants
@@ -71,47 +73,38 @@ class NeuralNetworkLateralControl(LatControlTorqueExtBase):
     return self.enabled and self.model_valid and self.has_nn_model
 
   def update_limits(self):
-    self.lac_torque.update_limits()
+    if not self._nnlc_enabled:
+      return
 
-  def reset(self):
-    self.lateral_accel_desired_deque.clear()
-    self.roll_deque.clear()
-    self.error_deque.clear()
-    self.pitch = FirstOrderFilter(0.0, 0.5, 0.01)
-    self.pitch_last = 0.0
-    self.actual_lateral_jerk = self.lateral_jerk_setpoint = self.lateral_jerk_measurement = self.lookahead_lateral_jerk = 0.0
+    self._pid.set_limits(self.lac_torque.steer_max, -self.lac_torque.steer_max)
 
   def update_lateral_lag(self, lag):
     super().update_lateral_lag(lag)
     self.nn_future_times = [t + self.desired_lat_jerk_time for t in self.future_times]
 
+  def update_feedforward_torque_space(self, CS):
+    torque_from_setpoint = self.torque_from_lateral_accel_in_torque_space(LatControlInputs(self._setpoint, self._roll_compensation, CS.vEgo, CS.aEgo),
+                                                                          self.torque_params, gravity_adjusted=False)
+    torque_from_measurement = self.torque_from_lateral_accel_in_torque_space(LatControlInputs(self._measurement, self._roll_compensation, CS.vEgo, CS.aEgo),
+                                                                             self.torque_params, gravity_adjusted=False)
+    self._pid_log.error = float(torque_from_setpoint - torque_from_measurement)
+    self._ff = self.torque_from_lateral_accel_in_torque_space(LatControlInputs(self._gravity_adjusted_lateral_accel, self._roll_compensation,
+                                                                               CS.vEgo, CS.aEgo), self.torque_params, gravity_adjusted=True)
+    self._ff += get_friction_in_torque_space(self._desired_lateral_accel - self._actual_lateral_accel, self._lateral_accel_deadzone,
+                                             FRICTION_THRESHOLD, self.torque_params)
+
   def update_output_torque(self, CS):
-    freeze_integrator = self._steer_limited_by_safety or CS.steeringPressed or CS.vEgo < 5 \
-                        or self.lac_torque.freeze_for_output_limit(self._pid_log.error)
+    freeze_integrator = self._steer_limited_by_safety or CS.steeringPressed or CS.vEgo < 5
     self._output_torque = self._pid.update(self._pid_log.error,
                                            feedforward=self.lac_torque.feedforward_gain * self._ff,
                                            speed=CS.vEgo,
                                            freeze_integrator=freeze_integrator)
 
-  def acceleration_error(self, speed, setpoint, measurement, desired_lateral_accel, roll, past_future_rolls):
-    # Hold friction/jerk equal when measuring acceleration error. Its planned
-    # contribution belongs in feedforward, not a wheel-jerk damping controller.
-    torque_from_setpoint = self.model.evaluate([speed, setpoint, 0.0, roll] + [setpoint] * self.past_future_len + past_future_rolls)
-    torque_from_measurement = self.model.evaluate([speed, measurement, 0.0, roll] + [measurement] * self.past_future_len + past_future_rolls)
-    error = torque_from_setpoint - torque_from_measurement
-
-    # Preserve the high-acceleration response used for models whose inverse
-    # torque curve flattens at large accelerations, with the same zero-jerk condition.
-    blend = float(np.interp(abs(desired_lateral_accel), [1.0, 2.0], [0.0, 1.0]))
-    if blend > 0.0:
-      torque_from_error = self.model.evaluate([speed, setpoint - measurement, 0.0, 0.0])
-      if sign(error) == sign(torque_from_error) and abs(error) < abs(torque_from_error):
-        error = error * (1.0 - blend) + torque_from_error * blend
-    return error
-
   def update_neural_network_feedforward(self, CS, params, calibrated_pose) -> None:
     if not self._nnlc_enabled:
       return
+
+    self.update_feedforward_torque_space(CS)
 
     low_speed_factor = float(np.interp(CS.vEgo, LOW_SPEED_X, LOW_SPEED_Y)) ** 2
     self._setpoint = self._desired_lateral_accel + low_speed_factor * self._desired_curvature
@@ -138,8 +131,33 @@ class NeuralNetworkLateralControl(LatControlTorqueExtBase):
     future_planned_lateral_accels = [np.interp(t, ModelConstants.T_IDXS, self.model_v2.acceleration.y) for t in
                                      adjusted_future_times]
 
-    self._pid_log.error = self.acceleration_error(CS.vEgo, self._setpoint, self._measurement,
-                                                 self._desired_lateral_accel, roll, past_rolls + future_rolls)
+    # compute NNFF error response
+    nnff_setpoint_input = [CS.vEgo, self._setpoint, self.lateral_jerk_setpoint, roll] \
+                          + [self._setpoint] * self.past_future_len \
+                          + past_rolls + future_rolls
+    # past lateral accel error shouldn't count, so use past desired like the setpoint input
+    nnff_measurement_input = [CS.vEgo, self._measurement, self.lateral_jerk_measurement, roll] \
+                             + [self._measurement] * self.past_future_len \
+                             + past_rolls + future_rolls
+    torque_from_setpoint = self.model.evaluate(nnff_setpoint_input)
+    torque_from_measurement = self.model.evaluate(nnff_measurement_input)
+    self._pid_log.error = torque_from_setpoint - torque_from_measurement
+
+    # The "pure" NNLC error response can be too weak for cars whose models were trained
+    # with a lack of high-magnitude lateral acceleration data, for which the NNLC model
+    # torque response flattens out at high lateral accelerations.
+    # This workaround blends in a guaranteed stronger error response only when the
+    # desired lateral acceleration is high enough to warrant it, by using the lateral acceleration
+    # error as the input to the NNLC model. This is not ideal, and potentially degrades the NNLC
+    # accuracy for cars that don't have this issue, but it's necessary until a better NNLC model
+    # structure is used that doesn't create this issue when high-magnitude data is missing.
+    error_blend_factor = float(np.interp(abs(self._desired_lateral_accel), [1.0, 2.0], [0.0, 1.0]))
+    if error_blend_factor > 0.0:  # blend in stronger error response when in high lat accel
+      # NNFF inputs 5+ are optional, and if left out are replaced with 0.0 inside the NNFF class
+      nnff_error_input = [CS.vEgo, self._setpoint - self._measurement, self.lateral_jerk_setpoint - self.lateral_jerk_measurement, 0.0]
+      torque_from_error = self.model.evaluate(nnff_error_input)
+      if sign(self._pid_log.error) == sign(torque_from_error) and abs(self._pid_log.error) < abs(torque_from_error):
+        self._pid_log.error = self._pid_log.error * (1.0 - error_blend_factor) + torque_from_error * error_blend_factor
 
     # compute feedforward (same as nn setpoint output)
     friction_input = self.update_friction_input(self._setpoint, self._measurement)
@@ -150,6 +168,14 @@ class NeuralNetworkLateralControl(LatControlTorqueExtBase):
 
     # apply friction override for cars with low NN friction response
     if self.model.friction_override:
-      self._ff += get_friction(friction_input, self._lateral_accel_deadzone, FRICTION_THRESHOLD, self.torque_params)
+      self._pid_log.error += get_friction(friction_input, self._lateral_accel_deadzone, FRICTION_THRESHOLD, self.torque_params)
 
     self.update_output_torque(CS)
+    self.sigmoid_map_tuner.observe(self._nnlc_enabled,
+                                   CS,
+                                   self._setpoint,
+                                   self._measurement,
+                                   self._desired_lateral_accel,
+                                   self._output_torque,
+                                   self._steer_limited_by_safety,
+                                   self._roll_compensation)

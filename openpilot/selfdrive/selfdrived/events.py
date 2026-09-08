@@ -239,19 +239,6 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.PERMANENT: NormalPermanentAlert("Driving Model Unavailable", "Waiting for healthy model output"),
   },
 
-  EventName.laneCenteringUnavailable: {
-    ET.NO_ENTRY: NoEntryAlert("Steering Command Unavailable"),
-    ET.IMMEDIATE_DISABLE: ImmediateDisableAlert("Steering Command Unavailable"),
-  },
-
-  EventName.laneCenteringCollisionRisk: {
-    ET.WARNING: Alert(
-      "Take Control",
-      "Road Boundary Collision Risk",
-      AlertStatus.userPrompt, AlertSize.mid,
-      Priority.HIGH, VisualAlert.steerRequired, AudibleAlert.promptRepeat, 1.),
-  },
-
   EventName.lateralManeuver: {
     ET.WARNING: longitudinal_maneuver_alert,
     ET.PERMANENT: NormalPermanentAlert("Lateral Maneuver Mode"),

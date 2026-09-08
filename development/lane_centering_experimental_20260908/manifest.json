@@ -1,0 +1,185 @@
+{
+  "preserved_branch": "archive/lane-centering-20260908",
+  "preserved_commit": "7d82d2ee3f217824b0c192073616584445f20466",
+  "road_confirmed_commit": "ad3e278b31a51f79c569fe5ce8545b70e44744a8",
+  "restored_tree_commit": "7fb091d5b999a2eb464c36ffdccb3a77deeb15a0",
+  "preserved_opendbc_commit": "ffcde19b8cb158d8f89619909ccd5a40dfcff174",
+  "restored_opendbc_commit": "85baf553c8b73bd1d14aeef20b1daa500e479b8a",
+  "files": [
+    {
+      "path": "openpilot/cereal/log.capnp",
+      "change": "M",
+      "sha256": "8737f31ad21e0e9e98a9bbf097b3d4a2cf5015b14c334c1f7dea39ff92923e75"
+    },
+    {
+      "path": "openpilot/selfdrive/controls/controlsd.py",
+      "change": "M",
+      "sha256": "af9a4c2a6d6f094dabba926f8d126ef6e0cb7350be1b091aa09506dd212c6217"
+    },
+    {
+      "path": "openpilot/selfdrive/controls/plannerd.py",
+      "change": "M",
+      "sha256": "dc1409ececff4818f3310926d75dfe2b9b2732fc3f0022ca0be4e0c619b9b709"
+    },
+    {
+      "path": "openpilot/selfdrive/controls/tests/test_plannerd_model_cache.py",
+      "change": "A",
+      "sha256": "7e9e51063142106f347b0dc779232db8f86f4cbb8d85f9e5f0dadb1b204c265a"
+    },
+    {
+      "path": "openpilot/selfdrive/modeld/lane_centering.py",
+      "change": "M",
+      "sha256": "6bb222384337870417f9ff2ff0316ed209ccb8197111be661ebcf843dfbbce67"
+    },
+    {
+      "path": "openpilot/selfdrive/modeld/lane_centering_integration.py",
+      "change": "M",
+      "sha256": "7102968540abf1182fbb562dd9ffe6e36c53046bed74979ddf3fe8daaee5488d"
+    },
+    {
+      "path": "openpilot/selfdrive/modeld/lane_centering_safety.py",
+      "change": "A",
+      "sha256": "cd40551babe517c41f6121e6b12e58eab1816c30527a6677f7ab6aaf6780830a"
+    },
+    {
+      "path": "openpilot/selfdrive/modeld/lane_centering_worker.py",
+      "change": "A",
+      "sha256": "732a9e151d4a56472748adfe26bfe94291f229c14127aa51a60656b88a53a4b9"
+    },
+    {
+      "path": "openpilot/selfdrive/modeld/lane_path.py",
+      "change": "A",
+      "sha256": "afda7f658d18464a8abd2ef3ae7593d2cddd2d6078ed8b2e9dec63d80d96dd3d"
+    },
+    {
+      "path": "openpilot/selfdrive/modeld/modeld.py",
+      "change": "M",
+      "sha256": "29629a12ff0a7b0b80a3ce5ce36dc7c875c779f23defdd91720ac8c2e027414b"
+    },
+    {
+      "path": "openpilot/selfdrive/modeld/planning_model.py",
+      "change": "A",
+      "sha256": "25df76f4532070019da6e5e5dd3aba35f353a20b565c07d52715168addae1837"
+    },
+    {
+      "path": "openpilot/selfdrive/modeld/tests/fixtures/lane_boundary_regressions.json",
+      "change": "A",
+      "sha256": "be0acc5b9c989cb32a6713ee2e93469d1b8bee0a46274dd90784920f67f545f6"
+    },
+    {
+      "path": "openpilot/selfdrive/modeld/tests/fixtures/native_ninety_degree_turn.json",
+      "change": "A",
+      "sha256": "867dbc4bbfe158d2ddc7e34309c896e0cf422fed30516e5d5f06ed7de2caf8c0"
+    },
+    {
+      "path": "openpilot/selfdrive/modeld/tests/test_lane_centering_integration.py",
+      "change": "M",
+      "sha256": "1b40417b03424dc714b337b781618fea71155a78cdba205564e6ebfbadca6771"
+    },
+    {
+      "path": "openpilot/selfdrive/modeld/tests/test_lane_centering_regression.py",
+      "change": "A",
+      "sha256": "f5a69cab02acb4f343b068bdb19a4624a6cec0a2f99358180f30ee9eb1e90c80"
+    },
+    {
+      "path": "openpilot/selfdrive/modeld/tests/test_lane_centering_safety.py",
+      "change": "A",
+      "sha256": "bf442d48e5d65a9e6125b9829b3cc4dc85cf850cd798f0c5b3aae5243900214c"
+    },
+    {
+      "path": "openpilot/selfdrive/modeld/tests/test_lane_centering_worker.py",
+      "change": "A",
+      "sha256": "9252dee81c4d6e81a59effa4eb82f5a0f6986a2aa6a5ebd139653817f6ed394e"
+    },
+    {
+      "path": "openpilot/selfdrive/modeld/tests/test_lane_corridor.py",
+      "change": "A",
+      "sha256": "2bd74d59c3d1196bdbc4a422c0c88bd5c5aa191e682b67192e42c96638bbda4f"
+    },
+    {
+      "path": "openpilot/selfdrive/modeld/tests/test_lane_fallback.py",
+      "change": "A",
+      "sha256": "8dd1b5e570b7690a58e644642752c26d84a7728b23418b964714424ff3907646"
+    },
+    {
+      "path": "openpilot/selfdrive/modeld/tests/test_lane_path.py",
+      "change": "A",
+      "sha256": "cc2b746521cd1a228e617b3076edbe8b777be2a8d3d17e8457cca900c3211d5f"
+    },
+    {
+      "path": "openpilot/selfdrive/modeld/tests/test_planning_model.py",
+      "change": "A",
+      "sha256": "2f5edff1c9e10b83d013e984371f25f87e5e311e9ae5072e7026a802963ef379"
+    },
+    {
+      "path": "openpilot/selfdrive/selfdrived/events.py",
+      "change": "M",
+      "sha256": "d6c41c234fb81b96efa0a1f85ce0b8372c632f5eb40f7188fe9ecc7f4d955ccc"
+    },
+    {
+      "path": "openpilot/selfdrive/selfdrived/selfdrived.py",
+      "change": "M",
+      "sha256": "965b137d466985b170cf6154f00991f9e1dcd9b2dc10d9d9815175434ae5e251"
+    },
+    {
+      "path": "openpilot/sunnypilot/modeld_v2/modeld.py",
+      "change": "M",
+      "sha256": "c22da36e64e69333d0cd4f30b749a974402f50d36a37aff1a805d6c668daaa06"
+    },
+    {
+      "path": "openpilot/sunnypilot/selfdrive/controls/lib/dec/dec.py",
+      "change": "M",
+      "sha256": "5dde13c6ca295baab622c2dcc37008bc9983016929e4d63a69192462e745c3b9"
+    },
+    {
+      "path": "openpilot/sunnypilot/selfdrive/controls/lib/dec/tests/test_dynamic_controller.py",
+      "change": "M",
+      "sha256": "c3cfe2fb28f7367fd03d455c3dcd8d057cbadd38f94ad2d8c247ee7dd3a84a61"
+    },
+    {
+      "path": "openpilot/sunnypilot/selfdrive/controls/lib/e2e_alerts_helper.py",
+      "change": "M",
+      "sha256": "293c31257f39e93b83481cad64c2dc23c8fd143ec651b38b5a60f64949d376db"
+    },
+    {
+      "path": "openpilot/sunnypilot/selfdrive/controls/lib/latcontrol_torque_c3x.py",
+      "change": "M",
+      "sha256": "928b36fd26669dd0eee24af0330792f69554a9b1f6b53341c5e7f3e5d6a0125b"
+    },
+    {
+      "path": "openpilot/sunnypilot/selfdrive/controls/lib/latcontrol_torque_ext_base.py",
+      "change": "M",
+      "sha256": "e5cf963f87ccd002737b3252d898446e8683509ab86f74ace8fb9bdd3062cddb"
+    },
+    {
+      "path": "openpilot/sunnypilot/selfdrive/controls/lib/nnlc/nnlc_c3x.py",
+      "change": "M",
+      "sha256": "04d805afb4ddfb0c2fd7e173b8d4807395ff7c6ea0825957db57016536c131b7"
+    },
+    {
+      "path": "openpilot/sunnypilot/selfdrive/controls/lib/nnlc/sigmoid_map_tuner.py",
+      "change": "M",
+      "sha256": "16d49a4967fb4335cb864c2ae68df507cdef32417c3951f79ea2c32141ff6439"
+    },
+    {
+      "path": "openpilot/sunnypilot/selfdrive/controls/lib/tests/fixtures/c3x_unwind_event.json",
+      "change": "A",
+      "sha256": "ca1302457680be21f6c7d8419a460c83c546d1d233b6ff98c9e9a8c46d8ab109"
+    },
+    {
+      "path": "openpilot/sunnypilot/selfdrive/controls/lib/tests/test_latcontrol_torque_c3x.py",
+      "change": "M",
+      "sha256": "b92ce1604c19727069b6adc3ae3ea500dc85773fb8994bef956ac099363c4b07"
+    },
+    {
+      "path": "opendbc_repo/opendbc/car/hyundai/carstate.py",
+      "change": "M",
+      "sha256": "046a4748f758d242f0b5f5122e082a1cf44b7ae76be626357562e2dd63e490eb"
+    },
+    {
+      "path": "opendbc_repo/opendbc/car/hyundai/tests/test_steering_rate.py",
+      "change": "A",
+      "sha256": "431b6616e5ebdf4a13e4431fe98788bea05da1379d4871689c9f4edff23efc2f"
+    }
+  ]
+}

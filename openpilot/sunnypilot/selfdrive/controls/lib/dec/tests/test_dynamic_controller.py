@@ -29,18 +29,13 @@ class MockParams:
   def get_bool(self, name):
     return True
 
-class MockSubMaster(dict):
-  def __init__(self, services):
-    super().__init__(services)
-    self.updated = dict.fromkeys(services, True)
-
 def default_sm():
-  sm = MockSubMaster({
+  sm = {
     'carState': MockCarState(vEgo=10.0, vCruise=20.0),
     'radarState': MockRadarState(present=1.0),
     'modelV2': MockModelData(valid=True),
     'selfdriveState': MockSelfDriveState(experimentalMode=True),
-  })
+  }
   return sm
 
 def mock_cp():

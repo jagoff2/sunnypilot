@@ -75,7 +75,7 @@ class E2EAlertsHelper:
 
     # Green Light Alert
     green_light_trigger = False
-    if self.green_light_state == E2EStates.ARMED and sm.updated['modelV2']:
+    if self.green_light_state == E2EStates.ARMED:
       if model_x[max_idx] > GREEN_LIGHT_X_THRESHOLD:
         self.green_light_trigger_timer += 1
       else:

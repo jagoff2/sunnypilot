@@ -5,7 +5,6 @@ from openpilot.cereal import log
 from opendbc.car.lateral import get_friction
 from openpilot.common.constants import ACCELERATION_DUE_TO_GRAVITY
 from openpilot.selfdrive.controls.lib.latcontrol import LatControl
-from openpilot.selfdrive.controls.lib.drive_helpers import MAX_LATERAL_JERK
 from openpilot.common.pid import PIDController
 
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_c3x_ext import LatControlTorqueExt
@@ -15,6 +14,10 @@ FRICTION_THRESHOLD = 0.3
 # Low-speed curvature blending (will be faded to ~0 above ~12 m/s)
 LOW_SPEED_X = [0, 10, 20, 30]          # m/s
 LOW_SPEED_Y = [10, 8, 6, 3]            # unitless base, but we fade it out at speed
+
+# Actuator-side jerk limit on commanded lateral acceleration (m/s^3)
+JERK_LIMIT_X = [0.0, 10.0, 20.0, 30.0]  # m/s
+JERK_LIMIT_Y = [10, 10, 2.5, 1.0]     # m/s^3
 
 # Damping on measured lateral jerk to reduce snap-in and overshoot
 BASE_JERK_DAMP_GAIN = 0.05  # unitless
@@ -39,10 +42,6 @@ class LatControlTorque(LatControl):
     self.torque_params = CP.lateralTuning.torque.as_builder()
     self.torque_from_lateral_accel = CI.torque_from_lateral_accel()
     self.lateral_accel_from_torque = CI.lateral_accel_from_torque()
-    # Keep a stable calibration for the common limiter. The optional sigmoid
-    # tuner wraps the controller's conversion methods with speed-dependent maps.
-    self._slew_torque_from_lataccel = self.torque_from_lateral_accel
-    self._slew_lataccel_from_torque = self.lateral_accel_from_torque
     self.feedforward_gain = 0.7
     self.pid = PIDController(1.0, 0.2, rate=1.0 / self.dt)
     self.update_limits()
@@ -53,12 +52,9 @@ class LatControlTorque(LatControl):
 
     # Internal state
     self._last_output_lataccel = 0.0
-    self._last_output_torque = 0.0
-    self._last_actual_lataccel = None
+    self._last_actual_lataccel = 0.0
     self._last_error = 0.0
-    self._output_limited = False
-    self._limit_error = 0.0
-    self._using_nnlc = None
+    self._last_desired_curvature = 0.0
 
   def update_torque_parameters(self, latAccelFactor, latAccelOffset, friction):
     self.torque_params.latAccelFactor = latAccelFactor
@@ -67,40 +63,16 @@ class LatControlTorque(LatControl):
     self.update_limits()
 
   def update_limits(self):
-    # NN feedback is in normalized torque; the scalar controller uses lat accel.
-    if hasattr(self, "extension") and self.extension._nnlc_enabled:
-      self.pid.set_limits(self.steer_max, -self.steer_max)
-    else:
-      self.pid.set_limits(self.lateral_accel_from_torque(self.steer_max, self.torque_params),
-                          self.lateral_accel_from_torque(-self.steer_max, self.torque_params))
+    # Limit in lat-acc space (handles non-linear torque map correctly)
+    self.pid.set_limits(self.lateral_accel_from_torque(self.steer_max, self.torque_params),
+                        self.lateral_accel_from_torque(-self.steer_max, self.torque_params))
 
-  def reset(self):
-    super().reset()
-    self.pid.reset()
-    self.extension.reset()
-    self._last_output_lataccel = 0.0
-    self._last_output_torque = 0.0
-    self._last_actual_lataccel = None
-    self._last_error = 0.0
-    self._output_limited = False
-    self._limit_error = 0.0
-    self._using_nnlc = None
-
-  def _apply_jerk_limit(self, target_lataccel):
-    """Use the planner's command envelope in calibrated acceleration units.
-
-    This bounds the request, not measured vehicle jerk. The previous custom
-    speed table was bypassed by NNLC and imposed an incompatible new tracking
-    limit when applied to its final output.
-    """
-    max_delta = MAX_LATERAL_JERK * self.dt
+  def _apply_jerk_limit(self, target_lataccel, v_ego):
+    """Slew-limit lateral acceleration by a speed-scaled jerk limit."""
+    max_jerk = float(np.interp(v_ego, JERK_LIMIT_X, JERK_LIMIT_Y))
+    max_delta = max_jerk * self.dt
     delta = np.clip(target_lataccel - self._last_output_lataccel, -max_delta, max_delta)
     return self._last_output_lataccel + delta
-
-  def freeze_for_output_limit(self, error):
-    # Stop integrating into a slew limit, but permit I to unwind immediately
-    # when the tracking error reverses while the output is still rate limited.
-    return self._output_limited and error * self._limit_error > 0.0 and error * self.pid.i >= 0.0
 
   @staticmethod
   def _deadzone(x, dz):
@@ -118,22 +90,12 @@ class LatControlTorque(LatControl):
     if not active:
       output_torque = 0.0
       pid_log.active = False
-      self.reset()
+      # Reset state to avoid stale rate limiting on resume
+      self._last_output_lataccel = 0.0
+      self._last_actual_lataccel = 0.0
+      self._last_error = 0.0
+      self._last_desired_curvature = 0.0
     else:
-      using_nnlc = self.extension._nnlc_enabled
-      if self._using_nnlc is not None and using_nnlc != self._using_nnlc:
-        # Do not carry an integrator across controllers with different units.
-        # Retain the last final request so the common limiter bridges the switch.
-        self.pid.reset()
-        self.extension.reset()
-        self._last_error = 0.0
-      self._using_nnlc = using_nnlc
-      # The scalar fallback may use a previously learned sigmoid conversion.
-      # Its limits and conversion must use this frame's speed/roll, not the last
-      # frame on which NNLC happened to be enabled.
-      self.extension.sigmoid_map_tuner.update_context(CS, params.roll * ACCELERATION_DUE_TO_GRAVITY)
-      self.update_limits()
-
       # Curvature/lat-acc measurement
       actual_curvature = -VM.calc_curvature(math.radians(CS.steeringAngleDeg - params.angleOffsetDeg), CS.vEgo, params.roll)
       roll_compensation = params.roll * ACCELERATION_DUE_TO_GRAVITY
@@ -173,8 +135,7 @@ class LatControlTorque(LatControl):
       # ---------- Symmetric cut-prevention (works both left & right) ----------
       # If |actual| > |desired|, reduce commanded lat-acc in the turn direction.
       # Stronger effect at higher speed (v^2) and larger inside excess.
-      same_sign = desired_curvature * actual_curvature > 0.0
-      inside_excess = max(0.0, abs(actual_curvature) - abs(desired_curvature)) if same_sign else 0.0
+      inside_excess = max(0.0, abs(actual_curvature) - abs(desired_curvature))
       if inside_excess > 0.0:
         cut_guard = -K_CUT * (CS.vEgo ** 2) * inside_excess * np.sign(desired_curvature)
         # Clamp guard to = 40% of planner accel (+floor)
@@ -183,6 +144,7 @@ class LatControlTorque(LatControl):
         desired_lateral_accel += cut_guard
 
       # ---------- Apex guard (directional; only when tighter with same sign) ----------
+      same_sign = (np.sign(desired_curvature) == np.sign(actual_curvature)) and (np.sign(desired_curvature) != 0.0)
       cutting_inside = same_sign and (abs(actual_curvature) > abs(desired_curvature))
       if cutting_inside:
         delta_k_in = (abs(actual_curvature) - abs(desired_curvature))  # =0
@@ -202,7 +164,7 @@ class LatControlTorque(LatControl):
       gravity_adjusted_lateral_accel = desired_lateral_accel - roll_compensation
 
       # One-step latency prediction on measurement (no extra signals required)
-      measured_jerk = 0.0 if self._last_actual_lataccel is None else (actual_lateral_accel - self._last_actual_lataccel) / self.dt
+      measured_jerk = (actual_lateral_accel - self._last_actual_lataccel) / self.dt
       pred_measurement = measurement + measured_jerk * self.dt
 
       # ---------- Aggressiveness scaling of PID error at high lat-acc ----------
@@ -220,44 +182,45 @@ class LatControlTorque(LatControl):
                          lateral_accel_deadzone, FRICTION_THRESHOLD, self.torque_params)
       ff -= BASE_JERK_DAMP_GAIN * measured_jerk
 
-      # Select one controller before advancing its PID. Updating the shared PID
-      # twice mixed acceleration and torque errors into the same integrator.
-      if using_nnlc:
-        pid_log, output_torque = self.extension.update(
-          CS, VM, self.pid, params, ff, pid_log,
-          setpoint, pred_measurement, calibrated_pose, roll_compensation,
-          desired_lateral_accel, actual_lateral_accel, lateral_accel_deadzone, gravity_adjusted_lateral_accel,
-          desired_curvature, actual_curvature, steer_limited_by_safety, 0.0
-        )
-      else:
-        freeze_integrator = steer_limited_by_safety or CS.steeringPressed or CS.vEgo < 5 or self.freeze_for_output_limit(pid_error)
-        if abs(desired_curvature) > 0.02 and CS.vEgo > 15.0:
-          self.pid.i = float(np.clip(self.pid.i, -0.15, 0.15))
-        if np.sign(self._last_error) != np.sign(pid_error) and abs(pid_error) < 2.0 * lateral_accel_deadzone:
-          self.pid.i *= 0.9
-        output_lataccel = self.pid.update(pid_error, feedforward=self.feedforward_gain * ff,
-                                          speed=CS.vEgo, freeze_integrator=freeze_integrator)
-        output_torque = self.torque_from_lateral_accel(output_lataccel, self.torque_params)
-        pid_log.error = float(pid_error)
+      # Freeze I when limited, overridden, or very low speed
+      freeze_integrator = steer_limited_by_safety or CS.steeringPressed or CS.vEgo < 5
 
-      # Limit the selected final request. Previously NNLC overwrote this limiter,
-      # and scaling only the target before limiting could amplify its old state.
-      # Re-express the previous request using today's calibration so a live
-      # torque-parameter update cannot itself create a command discontinuity.
-      self._last_output_lataccel = self._slew_lataccel_from_torque(self._last_output_torque, self.torque_params)
-      requested_torque = output_torque
-      requested_lataccel = self._slew_lataccel_from_torque(output_torque, self.torque_params)
-      output_lataccel = self._apply_jerk_limit(requested_lataccel)
-      output_torque = float(np.clip(self._slew_torque_from_lataccel(output_lataccel, self.torque_params), -self.steer_max, self.steer_max))
-      self._limit_error = requested_torque - output_torque
-      self._output_limited = abs(self._limit_error) > 1e-6
-      if using_nnlc:
-        self.extension.sigmoid_map_tuner.observe(True, CS, self.extension._setpoint, self.extension._measurement,
-                                                 desired_lateral_accel, output_torque,
-                                                 steer_limited_by_safety or self._output_limited, roll_compensation)
+      # Clamp integrator in tight/high-speed turns
+      if abs(desired_curvature) > 0.02 and CS.vEgo > 15.0:  # ~R<50 m at 15 m/s
+        self.pid.i = float(np.clip(self.pid.i, -0.15, 0.15))
+
+      # Gentle integrator bleed to prevent "stacking up" after sign flip with small error
+      if np.sign(self._last_error) != np.sign(pid_error) and abs(pid_error) < 2.0 * lateral_accel_deadzone:
+        self.pid.i *= 0.9
+
+      # PID in lat-acc space
+      output_lataccel = self.pid.update(pid_error,
+                                        feedforward=self.feedforward_gain * ff,
+                                        speed=CS.vEgo,
+                                        freeze_integrator=freeze_integrator)
+
+      # Anticipatory jerk scaling based on desired curvature slew
+      desired_curvature_rate = (desired_curvature - self._last_desired_curvature) / self.dt
+      jerk_scale = 1.0 / (1.0 + 6.0 * abs(desired_curvature_rate))
+      jerk_scale = float(np.clip(jerk_scale, 0.5, 1.0))
+
+      # Actuator-side jerk limiting (complements planner s clip)
+      output_lataccel = self._apply_jerk_limit(output_lataccel * jerk_scale, CS.vEgo) / max(jerk_scale, 1e-3)
+
+      # Map desired lat-acc to torque
+      output_torque = self.torque_from_lateral_accel(output_lataccel, self.torque_params)
+
+      # sunnypilot extension can override error and torque if desired
+      pid_log, output_torque = self.extension.update(
+        CS, VM, self.pid, params, ff, pid_log,
+        setpoint, pred_measurement, calibrated_pose, roll_compensation,
+        desired_lateral_accel, actual_lateral_accel, lateral_accel_deadzone, gravity_adjusted_lateral_accel,
+        desired_curvature, actual_curvature, steer_limited_by_safety, output_torque
+      )
 
       # Logging
       pid_log.active = True
+      pid_log.error = float(pid_error)
       pid_log.p = float(self.pid.p)
       pid_log.i = float(self.pid.i)
       pid_log.d = float(self.pid.d)
@@ -269,10 +232,10 @@ class LatControlTorque(LatControl):
                                                       CS, steer_limited_by_safety, curvature_limited))
 
       # State update
-      self._last_output_lataccel = self._slew_lataccel_from_torque(output_torque, self.torque_params)
-      self._last_output_torque = output_torque
+      self._last_output_lataccel = output_lataccel
       self._last_actual_lataccel = actual_lateral_accel
-      self._last_error = pid_log.error
+      self._last_error = pid_error
+      self._last_desired_curvature = desired_curvature
 
     # TODO left is positive in this convention
     return -output_torque, 0.0, pid_log

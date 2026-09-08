@@ -38,7 +38,6 @@ from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
 from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, smooth_value
 from openpilot.selfdrive.modeld.lane_centering_integration import LaneCenteringModelAdapter, update_lane_change_helpers
 from openpilot.selfdrive.modeld.lane_centering import ACTION_SMOOTH_SECONDS
-from openpilot.selfdrive.modeld.lane_centering_worker import create_lane_planner_worker
 
 from openpilot.sunnypilot.modeld_v2.fill_model_msg import fill_model_msg, fill_pose_msg, PublishState, get_curvature_from_output
 from openpilot.sunnypilot.modeld_v2.constants import Plan
@@ -380,7 +379,7 @@ def main(demo=False):
 
   # TODO Move smooth seconds to action function
   long_delay = CP.longitudinalActuatorDelay + model.LONG_SMOOTH_SECONDS
-  lane_centering = LaneCenteringModelAdapter("absolute", worker=create_lane_planner_worker())
+  lane_centering = LaneCenteringModelAdapter("absolute")
 
   DH = DesireHelper()
   meta_constants = {chestnut: load_meta_constants(chestnut=chestnut) for chestnut in (False, True)}
@@ -462,10 +461,10 @@ def main(demo=False):
     bufs = {name: buf_extra if 'big' in name else buf_main for name in model.vision_input_names}
     transforms = {name: model_transform_extra if 'big' in name else model_transform_main for name in model.vision_input_names}
 
-    frame_delay = lane_centering.frame_delay # filtered complete camera-to-publication age, including lane planning
-    action_delay = lane_centering.action_delay # midpoint of the filtered valid-publication interval for lateral control
+    frame_delay = DT_MDL # compensate for time passed since the frame was captured: current_time - timestamp_eof is 50ms on average
+    action_delay = DT_MDL / 2 # middle of the interval between model output (current state) and next frame (expected state)
     lat_action_t = lat_delay + frame_delay + action_delay
-    long_action_t = long_delay + frame_delay + DT_MDL / 2
+    long_action_t = long_delay + frame_delay + action_delay
 
     inputs:dict[str, np.ndarray] = {
       model.desire_key: vec_desire,
@@ -478,9 +477,6 @@ def main(demo=False):
     model_output = model.run(bufs, transforms, inputs, prepare_only)
     mt2 = time.perf_counter()
     model_execution_time = mt2 - mt1
-    # Allow one camera period of optional work, including IPC. Acquisition can
-    # cost more than steady tracking; GPU time must not consume this budget.
-    planner_deadline = time.monotonic() + DT_MDL
 
     if model_output is not None:
       modelv2_send = messaging.new_message('modelV2')
@@ -490,16 +486,10 @@ def main(demo=False):
 
       update_lane_change_helpers(model_output, sm['carState'], sm['carControl'].latActive, v_ego,
                                  DH, RELC, mdv2sp_send.modelDataV2SP)
-      selected_model_output, action, lane_centering_status = lane_centering.update(
+      selected_model_output, action, _ = lane_centering.update(
         model_output, model.get_action_from_model, sm, live_calib_seen, DH.lane_change_state,
-        meta_main.timestamp_eof, v_ego, lat_action_t, long_action_t, planner_deadline=planner_deadline,
+        meta_main.timestamp_eof, v_ego, lat_action_t, long_action_t,
       )
-      if not lane_centering.plan_valid:
-        lane_centering.fill_invalid_model(modelv2_send, action, lane_centering_status, meta_main.frame_id, meta_main.timestamp_eof)
-        modelv2_send.modelV2.big = model.chestnut
-        pm.send('modelV2', modelv2_send)
-        last_vipc_frame_id = meta_main.frame_id
-        continue
       fill_model_msg(drivingdata_send, modelv2_send, selected_model_output, action,
                      publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
                      frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, live_calib_seen, meta_constants[model.chestnut])
@@ -512,8 +502,6 @@ def main(demo=False):
       drivingdata_send.drivingModelData.meta.laneChangeDirection = DH.lane_change_direction
 
       fill_pose_msg(posenet_send, model_output, meta_main.frame_id, vipc_dropped_frames, meta_main.timestamp_eof, live_calib_seen)
-      modelv2_send.valid = modelv2_send.valid and lane_centering.frame_valid
-      lane_centering.fill_status(modelv2_send.modelV2, lane_centering_status)
       pm.send('modelV2', modelv2_send)
       pm.send('drivingModelData', drivingdata_send)
       pm.send('cameraOdometry', posenet_send)
