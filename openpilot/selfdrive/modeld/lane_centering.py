@@ -8,14 +8,19 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.drive_helpers import (
   MAX_CURVATURE,
   MAX_LATERAL_ACCEL_NO_ROLL,
+  MAX_LATERAL_JERK,
   get_curvature_from_plan,
   smooth_value,
 )
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
+from openpilot.selfdrive.modeld.lane_path import (
+  Corridor, HALF_LENGTH, HALF_WIDTH, LanePath, LaneReference, RECOVERY_NUMERICAL_MARGIN, RECOVERY_TIME,
+  build_sparse_lane_candidates, evaluate_lane_dynamics, lane_dynamics_lower_bounds, valid_plan,
+)
 
 
 CAMERA_OFFSET = 0.04
-EGO_HALF_WIDTH = 1.08
+EGO_HALF_WIDTH = HALF_WIDTH
 
 MIN_LANE_WIDTH = 2.45
 HOLD_MIN_LANE_WIDTH = 2.25
@@ -32,9 +37,7 @@ ENTRY_STD_MAX = 0.30
 HOLD_STD_MEDIAN = 0.30
 HOLD_STD_MAX = 0.50
 # The model has no road-edge probability head. This is the same confidence
-# proxy used by the UI: clip(1 - road_edge_std, 0, 1). Requiring confidence
-# strictly above 0.80 is therefore equivalent to requiring std strictly below
-# 0.20 at every geometry sample used by the controller.
+# proxy used by the UI: clip(1 - road_edge_std, 0, 1).
 ROAD_EDGE_CONFIDENCE = 0.60
 
 ENTRY_TIME = 0.75
@@ -67,11 +70,10 @@ AVOIDANCE_DIVERGENCE = 0.45
 AVOIDANCE_GROWTH = 0.20
 
 CENTERLINE_FILTER_TAU = 0.10
-MIN_MERGE_DISTANCE = 12.0
-NOMINAL_MERGE_TIME = 2.75
-MAX_MERGE_DISTANCE = 70.0
+MIN_RESPONSE_TIME = 0.15
+MAX_RESPONSE_TIME = 1.50
 MAX_INITIAL_CURVATURE = MAX_CURVATURE
-MAX_LANE_PATH_JERK = 5.0
+MAX_LANE_PATH_JERK = MAX_LATERAL_JERK
 MAX_LANE_PATH_ACCEL = MAX_LATERAL_ACCEL_NO_ROLL
 SPATIAL_DYNAMICS_MARGIN = 0.999
 ACTION_SMOOTH_SECONDS = 0.10
@@ -112,6 +114,11 @@ class LaneCenteringStatus:
   edge_gate: str
   entry_gate: str
   policy_gate: str
+  containment: str = "unavailable"
+  min_clearance: float = np.nan
+  response_time: float = np.nan
+  safety_blocked: bool = False
+  checked_distance: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -206,6 +213,7 @@ class LaneCenteringController:
     self.last_policy_disagreement = np.nan
     self.last_policy_weight = 0.0
     self.last_path_weight = 0.0
+    self.maximum_guard_weight = 0.0
     self.last_curvature_correction = 0.0
     self.filtered_center_y: np.ndarray | None = None
     self.last_lane_path_feasibility = np.nan
@@ -227,10 +235,28 @@ class LaneCenteringController:
     self.source_handoff_previous_center: np.ndarray | None = None
     self.source_handoff_previous_width: np.ndarray | None = None
     self.candidate_gates: dict[str, tuple[str, str]] = {}
+    self.corridor: Corridor | None = None
+    self.corridor_age = 0.0
+    self.corridor_seen = False
+    self.containment = "unavailable"
+    self.min_clearance = np.nan
+    self.response_time = np.nan
+    self.checked_distance = 0.0
+    self.safety_blocked = False
+    self.safety_reason = ""
+    self.recovery_penetration = 0.0
+    self.recovery_elapsed = 0.0
+    self.recovery_delay = 0.0
+    self.publish_dtype = np.dtype(np.float64)
+    self.certified_plan: np.ndarray | None = None
+    self.certified_margin = np.nan
 
   @staticmethod
   def _lane_probs(model_output: dict[str, np.ndarray]) -> np.ndarray | None:
-    raw = np.asarray(model_output.get("lane_lines_prob", []), dtype=np.float64).reshape(-1)
+    try:
+      raw = np.asarray(model_output.get("lane_lines_prob", []), dtype=np.float64).reshape(-1)
+    except (TypeError, ValueError):
+      return None
     if raw.size == 8:
       raw = raw[1::2]
     if raw.size != 4 or not np.all(np.isfinite(raw)):
@@ -240,11 +266,13 @@ class LaneCenteringController:
   @staticmethod
   def _std_valid(stds: np.ndarray, median_limit: float, max_limit: float) -> bool:
     near = np.interp(GEOMETRY_X, MODEL_X, stds)
-    return bool(np.all(np.isfinite(near)) and np.median(near) <= median_limit and np.max(near) <= max_limit)
+    dense_near = np.r_[stds[MODEL_X <= GEOMETRY_X[-1]], near]
+    return bool(np.all(np.isfinite(dense_near)) and np.all(dense_near >= 0.0) and
+                np.median(near) <= median_limit and np.max(dense_near) <= max_limit)
 
   @staticmethod
   def _road_edge_confidence(stds: np.ndarray) -> float:
-    near = np.interp(GEOMETRY_X, MODEL_X, stds)
+    near = np.r_[stds[MODEL_X <= GEOMETRY_X[-1]], np.interp(GEOMETRY_X, MODEL_X, stds)]
     if not np.all(np.isfinite(near)) or np.any(near < 0.0):
       return -np.inf
     return float(np.min(np.clip(1.0 - near, 0.0, 1.0)))
@@ -425,19 +453,15 @@ class LaneCenteringController:
     if np.any(left_sample >= right_sample):
       return None, "crossing"
 
-    if geometry_mode == "entry":
-      # The camera is 4 cm right of vehicle center. These are the same ego-envelope
-      # conventions used by lane-departure warning.
-      if np.any(left_sample[:2] > -(EGO_HALF_WIDTH + CAMERA_OFFSET)):
-        return None, "ego_left"
-      if np.any(right_sample[:2] < EGO_HALF_WIDTH - CAMERA_OFFSET):
-        return None, "ego_right"
-    else:
-      vehicle_center_y = -CAMERA_OFFSET
-      if np.any(left_sample[:2] >= vehicle_center_y):
-        return None, "ego_center_left"
-      if np.any(right_sample[:2] <= vehicle_center_y):
-        return None, "ego_center_right"
+    # This only identifies the current lane. Full-body containment and bounded
+    # recovery are enforced on every selected trajectory by the output guard.
+    # Rejecting a partially overlapping body here would discard its recovery
+    # reference precisely when it is needed most.
+    vehicle_center_y = -CAMERA_OFFSET
+    if left_sample[0] >= vehicle_center_y:
+      return None, "ego_center_left"
+    if right_sample[0] <= vehicle_center_y:
+      return None, "ego_center_right"
 
     if geometry_mode == "recovery":
       pair_matches, pair_gate = self._line_pair_matches(left_sample, right_sample, source)
@@ -557,6 +581,13 @@ class LaneCenteringController:
       left_y, right_y = edge_y[0], lane_y[2]
     else:
       raise ValueError(f"unsupported mixed boundary source: {source!r}")
+
+    opposite_index = 3 - line_index
+    if (probs[opposite_index] > HOLD_LANE_PROB and
+        self._std_valid(lane_std[opposite_index], HOLD_STD_MEDIAN, HOLD_STD_MAX)):
+      # A shoulder is not an alternative lane. Geometry/continuity rejection of
+      # the painted pair must not silently make a wider road-edge pair eligible.
+      return None, "opposite_painted_line", "opposite_painted_line"
 
     entry_probability_valid = bool(probs[line_index] > ENTRY_LANE_PROB)
     hold_probability_valid = bool(probs[line_index] > HOLD_LANE_PROB)
@@ -912,12 +943,166 @@ class LaneCenteringController:
     result[right] = y[-1] + right_slope * (x_new[right] - x[-1])
     return result
 
+  @staticmethod
+  def _propagate_corridor(corridor: Corridor, distance: float, curvature: float) -> Corridor | None:
+    """Retain a conservative corridor after motion and boundary resampling.
+
+    Moving old boundary knots onto the fixed model grid can smooth away an
+    inward kink. Bound that reconstruction error over the full retained domain
+    and shift each resampled side inward. The difference of two piecewise
+    linear curves attains its extrema at their combined knots and endpoints.
+    """
+    rotation = curvature * distance
+    dx = np.sin(rotation) / curvature if abs(curvature) > 1e-6 else distance
+    dy = (1 - np.cos(rotation)) / curvature if abs(curvature) > 1e-6 else 0.0
+    cosine, sine = np.cos(rotation), np.sin(rotation)
+    transformed, endpoints = [], []
+    for boundary in (corridor.left, corridor.right):
+      x = cosine * (MODEL_X - dx) + sine * (boundary - dy)
+      y = -sine * (MODEL_X - dx) + cosine * (boundary - dy)
+      if not np.all(np.isfinite(x)) or not np.all(np.isfinite(y)) or np.any(np.diff(x) <= 1e-6):
+        return None
+      endpoint_y = np.interp(corridor.horizon, MODEL_X, boundary)
+      endpoints.append(cosine * (corridor.horizon - dx) + sine * (endpoint_y - dy))
+      transformed.append((x, y))
+    horizon = max(0.0, min(endpoints))
+    if horizon <= HALF_LENGTH + HALF_WIDTH:
+      return None
+
+    # This includes the rear tangent used for body clearance at the origin.
+    start = -HALF_LENGTH - HALF_WIDTH
+    propagated = []
+    for side, (x, y) in enumerate(transformed):
+      resampled = LaneCenteringController._interp_with_extrapolation(MODEL_X, x, y)
+      knots = np.unique(np.r_[start, horizon, x[(x > start) & (x < horizon)], MODEL_X[(MODEL_X > start) & (MODEL_X < horizon)]])
+      actual = LaneCenteringController._interp_with_extrapolation(knots, x, y)
+      reconstruction = LaneCenteringController._interp_with_extrapolation(knots, MODEL_X, resampled)
+      difference = actual - reconstruction
+      correction = max(0.0, float(np.max(difference))) if side == 0 else min(0.0, float(np.min(difference)))
+      propagated.append(resampled + correction)
+    return Corridor(*propagated, horizon)
+
+  def _refresh_corridor(self, model_output: dict[str, np.ndarray], v_ego: float,
+                        current_curvature: float, lat_action_t: float) -> None:
+    """Obtain clearance limits independently of the lane-source state machine."""
+    extracted, probs = self._extract_boundaries(model_output), self._lane_probs(model_output)
+    corridor = None
+    boundaries: list[np.ndarray | None] = [None, None]
+    confidence_masks = [np.zeros_like(MODEL_X, dtype=bool), np.zeros_like(MODEL_X, dtype=bool)]
+    required_end = int(np.searchsorted(MODEL_X, GEOMETRY_X[-1]))
+
+    def supported_end(mask):
+      unsupported = np.flatnonzero(~mask)
+      return int(unsupported[0] - 1) if len(unsupported) else len(MODEL_X) - 1
+
+    def finite_tail(boundary, end):
+      # Only this supported prefix is certified. A finite tangent after it is
+      # array hygiene for later transforms, never additional observed geometry.
+      result = boundary.copy()
+      if end < len(MODEL_X) - 1:
+        slope = (result[end] - result[end - 1]) / (MODEL_X[end] - MODEL_X[end - 1])
+        result[end + 1:] = result[end] + slope * (MODEL_X[end + 1:] - MODEL_X[end])
+      return result
+
+    if extracted is not None and probs is not None:
+      lane_y, lane_std, edge_y, edge_std = extracted
+      for side, (lane_idx, edge_idx) in enumerate(((1, 0), (2, 1))):
+        paint_claimed = probs[lane_idx] > HOLD_LANE_PROB
+        required_y, required_std = lane_y[lane_idx, :required_end + 1], lane_std[lane_idx, :required_end + 1]
+        if paint_claimed and (not np.all(np.isfinite(required_y)) or not np.all(np.isfinite(required_std)) or np.any(required_std < 0)):
+          # Malformed claimed paint is not evidence that an outside edge may
+          # enlarge the lane. Ordinary low confidence still permits edge use.
+          self.safety_blocked = True
+          self.safety_reason = "corridor_invalid"
+        paint_valid = (probs[lane_idx] > HOLD_LANE_PROB and
+                       self._std_valid(lane_std[lane_idx], HOLD_STD_MEDIAN, HOLD_STD_MAX))
+        edge_valid = self._road_edge_confidence(edge_std[edge_idx]) > ROAD_EDGE_CONFIDENCE
+        boundary = lane_y[lane_idx] if paint_valid else edge_y[edge_idx] if edge_valid else None
+        edge_mask = np.isfinite(edge_std[edge_idx]) & (edge_std[edge_idx] >= 0) & (edge_std[edge_idx] < 1 - ROAD_EDGE_CONFIDENCE)
+        paint_mask = np.isfinite(lane_std[lane_idx]) & (lane_std[lane_idx] >= 0) & (lane_std[lane_idx] <= HOLD_STD_MAX)
+        supported = (paint_mask & np.isfinite(lane_y[lane_idx]) if paint_valid else
+                     edge_mask & np.isfinite(edge_y[edge_idx]) if edge_valid else np.zeros_like(MODEL_X, dtype=bool))
+        if boundary is not None and paint_valid and edge_valid:
+          # A credible road edge inside paint is an additional constraint; an
+          # edge outside paint must never enlarge the permitted lane. A bad far
+          # point must not discard valid inward edge constraints nearby.
+          intersection = (np.maximum(boundary, edge_y[edge_idx]) if lane_idx == 1 else
+                          np.minimum(boundary, edge_y[edge_idx]))
+          boundary = np.where(edge_mask & np.isfinite(edge_y[edge_idx]), intersection, boundary)
+          supported &= ~edge_mask | np.isfinite(edge_y[edge_idx])
+        boundaries[side] = None if boundary is None else boundary + CAMERA_OFFSET
+        confidence_masks[side] = supported
+        if boundary is not None and supported_end(supported) < required_end:
+          self.safety_blocked = True
+          self.safety_reason = "corridor_invalid"
+      if all(boundary is not None for boundary in boundaries):
+        left, right = boundaries
+        end = supported_end(confidence_masks[0] & confidence_masks[1])
+        if np.any((right - left)[:max(end + 1, 0)] <= 0):
+          self.safety_blocked = True
+          self.safety_reason = "corridor_crossing"
+        elif end >= required_end:
+          # Width and width-span gates identify a lane to track; they must not
+          # erase fresh limits such as an inward pinch or a widening junction.
+          corridor = Corridor(finite_tail(left, end), finite_tail(right, end), float(MODEL_X[end]))
+
+    if corridor is not None:
+      self.corridor, self.corridor_age, self.corridor_seen = corridor, 0.0, True
+    elif self.corridor is not None:
+      self.corridor_age += self.frame_dt
+      if self.corridor_age > INVALID_GRACE_TIME:
+        self.corridor = None
+      else:
+        # Brief confidence dropouts retain the last limits in the new ego frame.
+        self.corridor = self._propagate_corridor(self.corridor, max(v_ego, 0) * self.motion_dt, current_curvature)
+        if self.corridor is not None:
+          held = [self.corridor.left, self.corridor.right]
+          horizon = self.corridor.horizon
+          for side, boundary in enumerate(boundaries):
+            end = supported_end(confidence_masks[side])
+            if boundary is not None and end >= required_end:
+              fresh = finite_tail(boundary, end)
+              held[side] = np.maximum(held[side], fresh) if side == 0 else np.minimum(held[side], fresh)
+              horizon = min(horizon, float(MODEL_X[end]))
+          # Partial fresh observations may tighten held limits but cannot renew
+          # their age or discard a fresh inward boundary on the available side.
+          self.corridor = Corridor(*held, horizon)
+          if np.any((held[1] - held[0])[MODEL_X <= horizon] <= 0):
+            self.safety_blocked = True
+            self.safety_reason = "corridor_crossing"
+
+    if self.corridor is None:
+      if self.corridor_seen and not self.safety_blocked:
+        self.safety_blocked = True
+        self.safety_reason = "corridor_lost"
+      return
+    initial_margin = self.corridor.initial_margin()
+    if initial_margin >= 0:
+      self.recovery_penetration = self.recovery_elapsed = 0.0
+    elif self.recovery_penetration == 0:
+      self.recovery_penetration = -initial_margin + RECOVERY_NUMERICAL_MARGIN
+      self.recovery_elapsed = 0.0
+      self.recovery_delay = min(max(lat_action_t, 0.0), 0.5)
+    else:
+      self.recovery_elapsed += self.frame_dt
+      if self.recovery_elapsed >= RECOVERY_TIME:
+        self.safety_blocked = True
+        self.safety_reason = "recovery_timeout"
+
+  def _check_containment(self, plan: np.ndarray, path: LanePath | None = None) -> tuple[bool, float]:
+    if plan is self.certified_plan:
+      return True, self.certified_margin
+    if self.corridor is None:
+      return True, np.nan
+    return self.corridor.check(plan, self.recovery_penetration, self.recovery_elapsed,
+                               self.recovery_delay, path, fast_reject=path is not None)
+
   def _propagate_centerline(self, v_ego: float, current_curvature: float) -> None:
     if self.filtered_center_y is None:
       return
 
     ds = max(float(v_ego), 0.0) * self.motion_dt
-    curvature = float(np.clip(current_curvature, -MAX_INITIAL_CURVATURE, MAX_INITIAL_CURVATURE))
+    curvature = float(current_curvature)
     dpsi = curvature * ds
     if abs(curvature) > 1e-6:
       dx = np.sin(dpsi) / curvature
@@ -932,9 +1117,6 @@ class LaneCenteringController:
     delta_y = self.filtered_center_y - dy
     transformed_x = cosine * delta_x + sine * delta_y
     transformed_y = -sine * delta_x + cosine * delta_y
-    order = np.argsort(transformed_x)
-    transformed_x = transformed_x[order]
-    transformed_y = transformed_y[order]
     if np.any(np.diff(transformed_x) <= 1e-6) or not np.all(np.isfinite(transformed_y)):
       self.filtered_center_y = None
       return
@@ -958,84 +1140,10 @@ class LaneCenteringController:
       alpha = 1.0 - np.exp(-self.frame_dt / CENTERLINE_FILTER_TAU)
     self.filtered_center_y += alpha * (measurement - self.filtered_center_y)
 
-  def _reference_coefficients(self) -> np.ndarray | None:
-    if self.filtered_center_y is None:
-      return None
-    center_sample = np.interp(GEOMETRY_X, MODEL_X, self.filtered_center_y)
-    coefficients = CENTERLINE_FIT_OPERATOR @ center_sample
-    return coefficients if np.all(np.isfinite(coefficients)) else None
-
-  @staticmethod
-  def _quintic_coefficients(join_distance: float, reference: np.ndarray,
-                            current_curvature: float) -> np.ndarray:
-    offset, slope, quadratic = reference
-    target_y = offset + slope * join_distance + quadratic * join_distance * join_distance
-    target_slope = slope + 2.0 * quadratic * join_distance
-    target_second = 2.0 * quadratic
-
-    coefficients = np.zeros(6, dtype=np.float64)
-    coefficients[2] = 0.5 * current_curvature
-    matrix = np.array([
-      [join_distance**3, join_distance**4, join_distance**5],
-      [3.0 * join_distance**2, 4.0 * join_distance**3, 5.0 * join_distance**4],
-      [6.0 * join_distance, 12.0 * join_distance**2, 20.0 * join_distance**3],
-    ])
-    residual = np.array([
-      target_y - coefficients[2] * join_distance**2,
-      target_slope - 2.0 * coefficients[2] * join_distance,
-      target_second - 2.0 * coefficients[2],
-    ])
-    coefficients[3:] = np.linalg.solve(matrix, residual)
-    return coefficients
-
-  @staticmethod
-  def _evaluate_spatial_path(x: np.ndarray, join_distance: float, reference: np.ndarray,
-                             quintic: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    x = np.asarray(x, dtype=np.float64)
-    merge = x <= join_distance
-    a0, a1, a2, a3, a4, a5 = quintic
-    merge_y = (((((a5 * x + a4) * x + a3) * x + a2) * x + a1) * x + a0)
-    merge_slope = ((((5.0 * a5 * x + 4.0 * a4) * x + 3.0 * a3) * x + 2.0 * a2) * x + a1)
-    merge_second = (((20.0 * a5 * x + 12.0 * a4) * x + 6.0 * a3) * x + 2.0 * a2)
-
-    offset, reference_slope, quadratic = reference
-    reference_y = offset + reference_slope * x + quadratic * x * x
-    reference_first = reference_slope + 2.0 * quadratic * x
-    y = np.where(merge, merge_y, reference_y)
-    slope = np.where(merge, merge_slope, reference_first)
-    second = np.where(merge, merge_second, 2.0 * quadratic)
-    return y, slope, second
-
-  def _lane_plan_for_distance(self, base_plan: np.ndarray, reference: np.ndarray,
-                              current_curvature: float, join_distance: float) -> np.ndarray:
-    lane_plan = np.array(base_plan, dtype=np.float64, copy=True)
-    speed = np.asarray(base_plan[0, :, Plan.VELOCITY.start], dtype=np.float64)
-    speed = np.maximum(speed, 0.0)
-    current_curvature = float(np.clip(current_curvature, -MAX_INITIAL_CURVATURE, MAX_INITIAL_CURVATURE))
-    quintic = self._quintic_coefficients(join_distance, reference, current_curvature)
-
-    time_indices = np.asarray(ModelConstants.T_IDXS, dtype=np.float64)
-    time_steps = np.diff(time_indices)
-    path_x = np.r_[0.0, np.cumsum(0.5 * (speed[:-1] + speed[1:]) * time_steps)]
-    for _ in range(2):
-      _, iteration_slope, _ = self._evaluate_spatial_path(path_x, join_distance, reference, quintic)
-      forward_velocity = speed / np.sqrt(1.0 + iteration_slope * iteration_slope)
-      path_x[1:] = np.cumsum(0.5 * (forward_velocity[:-1] + forward_velocity[1:]) * time_steps)
-
-    path_y, slope, second = self._evaluate_spatial_path(path_x, join_distance, reference, quintic)
-    curvature = second / np.power(1.0 + slope * slope, 1.5)
-    yaw = np.arctan(slope)
-
-    lane_plan[0, :, Plan.POSITION.start] = path_x
-    lane_plan[0, :, Plan.POSITION.start + 1] = path_y
-    lane_plan[0, :, Plan.VELOCITY.start + 1] = 0.0
-    lane_plan[0, :, Plan.ACCELERATION.start + 1] = curvature * speed * speed
-    lane_plan[0, :, Plan.T_FROM_CURRENT_EULER.start + 2] = yaw
-    lane_plan[0, :, Plan.ORIENTATION_RATE.start + 2] = curvature * speed
-    return lane_plan
-
   @staticmethod
   def _lateral_plan_feasible(plan: np.ndarray, margin: float = 1.0) -> bool:
+    if plan.shape != (1, ModelConstants.IDX_N, ModelConstants.PLAN_WIDTH) or not np.all(np.isfinite(plan)):
+      return False
     lateral_accel = plan[0, :, Plan.ACCELERATION.start + 1]
     time_indices = np.asarray(ModelConstants.T_IDXS, dtype=np.float64)
     lateral_jerk = np.diff(lateral_accel) / np.diff(time_indices)
@@ -1048,22 +1156,128 @@ class LaneCenteringController:
                        current_curvature: float) -> tuple[np.ndarray | None, float]:
     if base_plan.shape != (1, ModelConstants.IDX_N, ModelConstants.PLAN_WIDTH) or not np.all(np.isfinite(base_plan)):
       return None, np.nan
-    reference = self._reference_coefficients()
-    if reference is None:
+    if self.filtered_center_y is None or not np.all(np.isfinite(self.filtered_center_y)):
       return None, np.nan
-
-    nominal_join_distance = float(np.clip(
-      NOMINAL_MERGE_TIME * max(v_ego, 1.0), MIN_MERGE_DISTANCE, MAX_MERGE_DISTANCE,
-    ))
-    lane_plan = self._lane_plan_for_distance(
-      base_plan, reference, current_curvature, nominal_join_distance,
+    if np.any(np.diff(base_plan[0, :, Plan.POSITION.start]) < 0):
+      return None, np.nan
+    reference_y = self.filtered_center_y.copy()
+    if self.corridor is not None:
+      # Own one complete trajectory, using measured lane geometry where it is
+      # supported and the native policy beyond that horizon. Do not extrapolate
+      # a near-field lane fit blindly across the entire ten-second prediction.
+      transition = max(v_ego, 10.0)
+      u = np.clip((MODEL_X - self.corridor.horizon) / transition, 0, 1)
+      blend = u**3 * (10 - 15*u + 6*u**2)
+      native_y = self._interp_with_extrapolation(MODEL_X, base_plan[0, :, Plan.POSITION.start],
+                                                base_plan[0, :, Plan.POSITION.start + 1])
+      reference_y = (1 - blend) * reference_y + blend * native_y
+    reference = LaneReference(reference_y, v_ego)
+    distances = np.maximum(1.0, v_ego * np.linspace(MIN_RESPONSE_TIME, MAX_RESPONSE_TIME, 28))
+    best_plan, best_distance = None, np.nan
+    cost_horizon = min(float(base_plan[0, -1, Plan.POSITION.start]), self.corridor.horizon if self.corridor is not None else 30.0)
+    cost_x = np.linspace(0, max(cost_horizon, 1.0), 101)
+    center = np.interp(cost_x, MODEL_X, self.filtered_center_y)
+    acceleration_limit = MAX_LANE_PATH_ACCEL * SPATIAL_DYNAMICS_MARGIN
+    jerk_limit = MAX_LANE_PATH_JERK * SPATIAL_DYNAMICS_MARGIN
+    plans, sparse_ok, y = build_sparse_lane_candidates(
+      base_plan, reference, current_curvature, distances, cost_x, acceleration_limit, jerk_limit, TIME_EPSILON,
     )
-    if self._lateral_plan_feasible(lane_plan, SPATIAL_DYNAMICS_MARGIN):
-      self.last_lane_path_feasibility = 1.0
-      return lane_plan, nominal_join_distance
-
-    self.last_lane_path_feasibility = 0.0
-    return None, nominal_join_distance
+    published = plans.astype(self.publish_dtype, copy=False)
+    if self.corridor is not None:
+      # A colliding published corner proves rejection cheaply for the whole
+      # batch. Passing this filter grants no certificate: dynamics, boundary
+      # intrusions, swept poses and implied motion are still checked below.
+      sparse_ok &= self.corridor.candidate_pose_mask(
+        published, self.recovery_penetration, self.recovery_elapsed, self.recovery_delay,
+      )
+    eligible = np.flatnonzero(sparse_ok)
+    # Track every reference sample in the usable horizon. Near-term error
+    # receives more weight, while the nonzero floor preserves full-horizon
+    # ownership. No remote terminal match substitutes for tracking cost.
+    weights = 0.2 + np.exp(-cost_x / max(v_ego, 1.0))
+    tracking_costs = np.mean((y - center)**2 * weights, axis=1)
+    lower_costs = tracking_costs.copy()
+    strengthen_bound = False
+    if len(eligible) > 2:
+      ranked = eligible[np.argsort(tracking_costs[eligible], kind="stable")]
+      sample_acceleration = plans[ranked[0], 0, :, Plan.ACCELERATION.start + 1]
+      estimated_jerk = np.max(abs(np.diff(sample_acceleration) / np.diff(ModelConstants.T_IDXS)))
+      # This estimate only schedules an optimization. It never certifies or
+      # rejects a path. When tracking costs are well separated, the cheap bound
+      # already prunes effectively and stronger interval work is unnecessary.
+      strengthen_bound = tracking_costs[ranked[2]] - tracking_costs[ranked[0]] < 0.00005 * estimated_jerk**2
+    if strengthen_bound:
+      acceleration_lower, jerk_lower = lane_dynamics_lower_bounds(
+        plans[eligible], reference, current_curvature, distances[eligible],
+      )
+      lower_costs[eligible] += 0.00005 * jerk_lower**2
+      eligible = eligible[(acceleration_lower <= acceleration_limit) & (jerk_lower <= jerk_limit)]
+    best_cost, best_index = np.inf, len(distances)
+    order = eligible[np.argsort(lower_costs[eligible], kind="stable")]
+    dense_acceleration = np.full(len(distances), np.nan)
+    dense_jerk = np.full(len(distances), np.nan)
+    # Tracking error plus a subset of exact dense jerk intervals is a lower
+    # bound on the complete cost. Evaluate full dynamics and clearance while a
+    # candidate can still improve the best feasible complete cost. This gives
+    # the same constrained minimum and original-index tie break as exhaustive
+    # evaluation, without densely differentiating every slower response.
+    rank, dense_complete, batch_requested = 0, False, False
+    while rank < len(order):
+      index = order[rank]
+      if not dense_complete and (lower_costs[index] > best_cost or
+                                 (lower_costs[index] == best_cost and index > best_index)):
+        break
+      if (rank >= 2 or batch_requested) and not dense_complete:
+        # Nearly aligned curves can leave many costs tied. Share the reference
+        # differentiation across the remaining exact dense checks instead of
+        # falling back to a long sequence of scalar evaluations.
+        remaining = order[rank:]
+        remaining = remaining[lower_costs[remaining] <= best_cost]
+        dense_acceleration[remaining], dense_jerk[remaining] = evaluate_lane_dynamics(
+          plans[remaining], reference, current_curvature, distances[remaining],
+        )
+        remaining = remaining[(dense_acceleration[remaining] <= acceleration_limit) &
+                              (dense_jerk[remaining] <= jerk_limit)]
+        costs = tracking_costs[remaining] + 0.00005 * dense_jerk[remaining]**2
+        order = remaining[np.lexsort((remaining, costs))]
+        # All remaining complete costs are now known. Check them in that order
+        # so the first feasible result is the final optimum, rather than proving
+        # several nearly identical paths in lower-bound order.
+        rank, dense_complete = 0, True
+        continue
+      rank += 1
+      distance, plan = float(distances[index]), plans[index]
+      path = LanePath(reference, current_curvature, distance)
+      if np.isnan(dense_acceleration[index]):
+        dense_acceleration[index], dense_jerk[index] = path.dynamics(plan)
+      acceleration, jerk = dense_acceleration[index], dense_jerk[index]
+      if not (acceleration <= acceleration_limit and jerk <= jerk_limit):
+        continue
+      cost = float(tracking_costs[index] + 0.00005 * jerk**2)
+      if cost > best_cost or (cost == best_cost and index >= best_index):
+        if dense_complete:
+          break
+        continue
+      if not dense_complete and np.count_nonzero(lower_costs[order[rank:]] < cost) >= 2:
+        # Even if this path is contained, several lower bounds would remain.
+        # Finish their shared dynamics first, so we need not prove a succession
+        # of near-identical aligned-curve paths before reaching the optimum.
+        rank -= 1
+        batch_requested = True
+        continue
+      # Certify the exact numeric representation that will be published, so a
+      # float32 cast cannot invalidate a float64 clearance decision afterward.
+      plan = published[index]
+      contained, margin = self._check_containment(plan, path)
+      if contained:
+        best_plan, best_distance = plan, distance
+        best_cost, best_index = cost, index
+        self.certified_plan, self.certified_margin = plan, margin
+        if dense_complete:
+          break
+    self.last_lane_path_feasibility = float(best_plan is not None)
+    self.response_time = best_distance / max(v_ego, 1.0)
+    return best_plan, best_distance
 
   @staticmethod
   def _blend_plans(base_plan: np.ndarray, lane_plan: np.ndarray, weight: float) -> np.ndarray:
@@ -1111,12 +1325,17 @@ class LaneCenteringController:
                      current_curvature: float, lat_action_t: float, base_smoothed_curvature: float,
                      previous_selected_curvature: float) -> dict[str, np.ndarray]:
     previous_path_weight = self.last_path_weight
+    self.maximum_guard_weight = min(1.0, previous_path_weight + self.frame_dt / CAPPED_PATH_WEIGHT_SLEW_TIME)
     self.last_path_weight = 0.0
     self.last_curvature_correction = 0.0
     self.last_requested_lateral_jerk = np.nan
+    if self.containment == "bypassed" or self.safety_blocked:
+      return model_output
 
     try:
-      base_plan = np.asarray(model_output["plan"], dtype=np.float64)
+      raw_plan = np.asarray(model_output["plan"])
+      self.publish_dtype = raw_plan.dtype
+      base_plan = np.asarray(raw_plan, dtype=np.float64)
     except (KeyError, IndexError, TypeError, ValueError):
       return model_output
 
@@ -1125,7 +1344,6 @@ class LaneCenteringController:
     if self.authority > 0.0 and self.filtered_center_y is not None:
       lane_plan, _ = self._build_lane_plan(base_plan, v_ego, current_curvature)
       if lane_plan is None:
-        self.reset()
         self.reason = "path_infeasible"
         self.entry_gate = "path_infeasible"
         self.policy_gate = "path_infeasible"
@@ -1139,9 +1357,26 @@ class LaneCenteringController:
     selected_plan = base_plan if lane_plan is None else self._blend_plans(base_plan, lane_plan, requested_weight)
     selected_curvature = self._plan_curvature(selected_plan, v_ego, lat_action_t)
     selected_smoothed_curvature = smooth_value(
-      selected_curvature, previous_selected_curvature, ACTION_SMOOTH_SECONDS,
+      selected_curvature, previous_selected_curvature, ACTION_SMOOTH_SECONDS, dt=self.frame_dt,
     )
 
+    if self.mode == "capped" and self.state == "active":
+      maximum_weight_step = self.frame_dt / CAPPED_PATH_WEIGHT_SLEW_TIME
+      slewed_weight = float(np.clip(
+        requested_weight,
+        max(0.0, previous_path_weight - maximum_weight_step),
+        min(1.0, previous_path_weight + maximum_weight_step),
+      ))
+      if slewed_weight != requested_weight:
+        requested_weight = slewed_weight
+        selected_plan = self._blend_plans(base_plan, lane_plan, requested_weight)
+        selected_curvature = self._plan_curvature(selected_plan, v_ego, lat_action_t)
+        selected_smoothed_curvature = smooth_value(
+          selected_curvature, previous_selected_curvature, ACTION_SMOOTH_SECONDS, dt=self.frame_dt,
+        )
+
+    # The correction cap is hard; apply it after the comfort slew. A tighter
+    # cap may require authority to release faster than the normal weight ramp.
     if self.mode == "capped" and lane_plan is not None and requested_weight > 0.0:
       correction_limit = min(
         MAX_CURVATURE_CORRECTION,
@@ -1150,7 +1385,7 @@ class LaneCenteringController:
       if abs(selected_smoothed_curvature - base_smoothed_curvature) > correction_limit:
         base_path_curvature = self._plan_curvature(base_plan, v_ego, lat_action_t)
         base_path_smoothed = smooth_value(
-          base_path_curvature, previous_selected_curvature, ACTION_SMOOTH_SECONDS,
+          base_path_curvature, previous_selected_curvature, ACTION_SMOOTH_SECONDS, dt=self.frame_dt,
         )
         denominator = selected_smoothed_curvature - base_path_smoothed
         target_correction = float(np.clip(
@@ -1169,22 +1404,7 @@ class LaneCenteringController:
         selected_plan = self._blend_plans(base_plan, lane_plan, requested_weight)
         selected_curvature = self._plan_curvature(selected_plan, v_ego, lat_action_t)
         selected_smoothed_curvature = smooth_value(
-          selected_curvature, previous_selected_curvature, ACTION_SMOOTH_SECONDS,
-        )
-
-    if self.mode == "capped" and self.state == "active":
-      maximum_weight_step = self.frame_dt / CAPPED_PATH_WEIGHT_SLEW_TIME
-      slewed_weight = float(np.clip(
-        requested_weight,
-        max(0.0, previous_path_weight - maximum_weight_step),
-        min(1.0, previous_path_weight + maximum_weight_step),
-      ))
-      if slewed_weight != requested_weight:
-        requested_weight = slewed_weight
-        selected_plan = self._blend_plans(base_plan, lane_plan, requested_weight)
-        selected_curvature = self._plan_curvature(selected_plan, v_ego, lat_action_t)
-        selected_smoothed_curvature = smooth_value(
-          selected_curvature, previous_selected_curvature, ACTION_SMOOTH_SECONDS,
+          selected_curvature, previous_selected_curvature, ACTION_SMOOTH_SECONDS, dt=self.frame_dt,
         )
 
     self.last_requested_lateral_jerk = (
@@ -1196,6 +1416,80 @@ class LaneCenteringController:
     selected_output["plan"] = selected_plan.astype(model_output["plan"].dtype, copy=False)
     self.last_path_weight = requested_weight
     self.last_curvature_correction = float(selected_smoothed_curvature - base_smoothed_curvature)
+    return selected_output
+
+  def _guard_output(self, model_output: dict[str, np.ndarray], selected_output: dict[str, np.ndarray],
+                    v_ego: float, current_curvature: float, lat_action_t: float,
+                    base_smoothed_curvature: float, previous_selected_curvature: float) -> dict[str, np.ndarray]:
+    if self.containment == "bypassed":
+      return selected_output
+    try:
+      plan = np.asarray(selected_output.get("plan", []))
+      if plan.dtype.kind not in "fiu":
+        plan = np.empty(0)
+    except (TypeError, ValueError):
+      plan = np.empty(0)
+    if not valid_plan(plan) or (v_ego > 0.3 and plan[0, -1, Plan.POSITION.start] <= 0.0):
+      self.safety_blocked, self.safety_reason = True, "invalid_plan"
+    if not self.safety_blocked and self.mode == "capped":
+      correction_limit = min(MAX_CURVATURE_CORRECTION, MAX_LATERAL_ACCEL_CORRECTION / max(v_ego**2, 1.0))
+      published_curvature = smooth_value(self._plan_curvature(plan, v_ego, lat_action_t),
+                                          previous_selected_curvature, ACTION_SMOOTH_SECONDS, dt=self.frame_dt)
+      if abs(published_curvature - base_smoothed_curvature) > correction_limit + TIME_EPSILON:
+        # Check the actual published dtype and both filter histories. Even a
+        # zero-weight policy path can violate the cap after a history change.
+        self.safety_blocked, self.safety_reason = True, "correction_limit"
+    if self.safety_blocked:
+      self.reason = self.safety_reason
+      self.containment = "blocked"
+      return selected_output
+    if self.corridor is None:
+      self.containment = "unavailable"
+      return selected_output
+
+    contained, margin = self._check_containment(plan)
+    dynamics_valid = self._lateral_plan_feasible(plan)
+    if not contained or not dynamics_valid:
+      # A blend or raw fallback can leave the corridor even when its generated
+      # lane path is safe. Re-plan against the current limits and check the actual
+      # published trajectory before granting any replacement authority.
+      reference = 0.5 * (self.corridor.left + self.corridor.right)
+      policy = self._evaluate_center_policy(model_output, reference)
+      replacement = None
+      widths = self.corridor.right - self.corridor.left
+      near_horizon = min(self.corridor.horizon, GEOMETRY_X[-1])
+      lane_identified = max(np.max(widths[MODEL_X <= near_horizon]),
+                            np.interp(near_horizon, MODEL_X, widths)) <= MAX_LANE_WIDTH
+      if lane_identified and not policy.hard_veto and self.reason != "policy_avoidance":
+        saved_center = self.filtered_center_y
+        self.filtered_center_y = reference
+        replacement, _ = self._build_lane_plan(np.asarray(model_output["plan"]), v_ego, current_curvature)
+        self.filtered_center_y = saved_center
+      if replacement is not None:
+        replacement_curvature = smooth_value(self._plan_curvature(replacement, v_ego, lat_action_t),
+                                              previous_selected_curvature, ACTION_SMOOTH_SECONDS, dt=self.frame_dt)
+        correction_limit = min(MAX_CURVATURE_CORRECTION, MAX_LATERAL_ACCEL_CORRECTION / max(v_ego**2, 1.0))
+        if self.mode == "capped" and (abs(replacement_curvature - base_smoothed_curvature) > correction_limit or
+                                      self.maximum_guard_weight < 1.0 - TIME_EPSILON):
+          replacement = None
+      if replacement is not None:
+        contained, margin = self._check_containment(replacement)
+        if contained and self._lateral_plan_feasible(replacement):
+          selected_output = model_output.copy()
+          selected_output["plan"] = replacement.astype(model_output["plan"].dtype, copy=False)
+          self.last_path_weight = 1.0
+          self.last_curvature_correction = replacement_curvature - base_smoothed_curvature
+          self.last_requested_lateral_jerk = abs(replacement_curvature - previous_selected_curvature) * max(v_ego**2, 1.0) / self.frame_dt
+          self.reason = "containment_recovery"
+        else:
+          replacement = None
+      if replacement is None:
+        self.safety_blocked = True
+        self.reason = "unsafe_policy_path" if policy.hard_veto else "no_contained_path"
+    self.min_clearance = margin
+    self.checked_distance = max(0.0, min(self.corridor.horizon - HALF_LENGTH - HALF_WIDTH,
+                                       float(selected_output["plan"][0, -1, Plan.POSITION.start])))
+    self.containment = "blocked" if self.safety_blocked else "recovering" if self.recovery_penetration > 0 else "contained"
     return selected_output
 
   def _start_exit(self, reason: str, hard: bool) -> None:
@@ -1239,6 +1533,11 @@ class LaneCenteringController:
       edge_gate=self.edge_gate,
       entry_gate=self.entry_gate,
       policy_gate=self.policy_gate,
+      containment=self.containment,
+      min_clearance=float(self.min_clearance),
+      response_time=float(self.response_time),
+      safety_blocked=self.safety_blocked,
+      checked_distance=self.checked_distance,
     )
 
   def _finish(self, model_output: dict[str, np.ndarray], v_ego: float,
@@ -1248,6 +1547,8 @@ class LaneCenteringController:
       model_output, v_ego, current_curvature, lat_action_t,
       base_smoothed_curvature, previous_selected_curvature,
     )
+    selected_output = self._guard_output(model_output, selected_output, v_ego, current_curvature,
+                                        lat_action_t, base_smoothed_curvature, previous_selected_curvature)
     return selected_output, self._status()
 
   def update(self, model_output: dict[str, np.ndarray], v_ego: float, current_curvature: float,
@@ -1259,21 +1560,38 @@ class LaneCenteringController:
     self.edge_gate = "not_evaluated"
     self.entry_gate = "not_evaluated"
     self.policy_gate = "not_evaluated"
+    # Certificates are local to one frame and one unchanged array. Blends,
+    # casts and fallback replacements receive their own complete checks.
+    self.certified_plan = None
+    self.certified_margin = np.nan
+    self.containment = "unavailable"
+    self.min_clearance = self.response_time = np.nan
+    self.checked_distance = 0.0
+    self.safety_blocked = False
+    self.safety_reason = ""
 
-    if self.mode == "off" or not lat_active:
+    if self.mode == "off":
       self.reset()
-      self.reason = "mode_off" if self.mode == "off" else "lateral_inactive"
+      self.reason = "mode_off"
       self.entry_gate = self.reason
       self.policy_gate = self.reason
+      self.containment = "bypassed"
       return model_output, self._status()
+    if not lat_active:
+      # Certify a fresh prospective action before engagement. Waiting for
+      # carControl.latActive would permit one unchecked model frame on engage,
+      # or deadlock if controls waited for certification before enabling it.
+      # Acquisition timers and steering authority still begin only on engage.
+      self.reset()
+      self.reason = "lateral_inactive"
 
     frame_gap = not np.isfinite(frame_dt) or frame_dt <= 0.0 or frame_dt > INVALID_GRACE_TIME
     if np.isfinite(frame_dt) and frame_dt > 0.0:
-      # State-machine timers must follow real elapsed time. Only ego-motion
-      # propagation is clipped, since an unusually delayed frame should not
-      # extrapolate the tracked centerline an arbitrarily large distance.
+      # Accepted intervals must move retained geometry by the actual elapsed
+      # time. Clipping them would put road boundaries in the wrong ego frame.
+      # Intervals beyond the confidence grace are blocked before propagation.
       self.frame_dt = float(frame_dt)
-      self.motion_dt = float(np.clip(frame_dt, 0.5 * DT_MDL, 5.0 * DT_MDL))
+      self.motion_dt = self.frame_dt
     else:
       self.frame_dt = DT_MDL
       self.motion_dt = DT_MDL
@@ -1293,12 +1611,23 @@ class LaneCenteringController:
       hard_reason = "invalid_model"
     elif left_blinker or right_blinker or lane_change_active:
       hard_reason = "lane_change"
+    elif v_ego <= 0.3:
+      hard_reason = "low_speed"
 
     if hard_reason is not None:
       self.entry_gate = hard_reason
       self.policy_gate = hard_reason
       self._clear_line_reference()
       self._start_exit(hard_reason, hard=True)
+      self.filtered_center_y = None
+      self.corridor = None
+      if hard_reason in ("lane_change", "low_speed"):
+        self.containment = "bypassed"
+        self.corridor_seen = False
+        self.recovery_penetration = self.recovery_elapsed = 0.0
+      else:
+        self.safety_blocked = True
+        self.safety_reason = hard_reason
       safe_action_t = lat_action_t if np.isfinite(lat_action_t) and lat_action_t > 0.0 else DT_MDL
       safe_base_curvature = base_smoothed_curvature if np.isfinite(base_smoothed_curvature) else 0.0
       safe_previous_curvature = previous_selected_curvature if np.isfinite(previous_selected_curvature) else 0.0
@@ -1307,6 +1636,10 @@ class LaneCenteringController:
         safe_base_curvature, safe_previous_curvature,
       )
 
+    self._refresh_corridor(model_output, v_ego, current_curvature, lat_action_t)
+    if not lat_active:
+      return self._finish(model_output, v_ego, current_curvature, lat_action_t,
+                          base_smoothed_curvature, previous_selected_curvature)
     lookahead = self._lookahead(v_ego)
     candidate = self._select_candidate(model_output, lookahead)
     candidate_valid = candidate is not None

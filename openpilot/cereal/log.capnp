@@ -131,6 +131,7 @@ struct OnroadEvent @0xc4fa6047f024e718 {
     excessiveActuation @96;
     bigModelLoading @100;
     bigModelFailed @102;
+    laneCenteringUnavailable @104;
 
     lowBatteryDEPRECATED @40;
     soundsUnavailableDEPRECATED @47;
@@ -1076,6 +1077,34 @@ struct ModelDataV2 {
 
   # e2e lateral planner
   action @26: Action;
+  # Published atomically with the selected action and trajectory. Version zero
+  # means the producer does not implement the lane containment contract.
+  laneCentering @28 :LaneCentering;
+
+  struct LaneCentering {
+    version @0 :UInt16;
+    valid @1 :Bool;
+    frameId @2 :UInt32;
+    timestampEof @3 :UInt64;
+    state @4 :Text;
+    source @5 :Text;
+    reason @6 :Text;
+    authority @7 :Float32;
+    pathWeight @8 :Float32;
+    containment @9 :Text;
+    minClearance @10 :Float32;
+    responseTime @11 :Float32; # whole-path error response time, seconds
+    safetyBlocked @12 :Bool;
+    lineGate @13 :Text;
+    edgeGate @14 :Text;
+    entryGate @15 :Text;
+    policyGate @16 :Text;
+    checkedDistance @17 :Float32; # forward center extent checked against trusted boundaries, meters
+    executionTime @18 :Float32; # adapter execution including planning and telemetry, seconds
+    publishAge @19 :Float32; # camera EOF to status completion immediately before publication, seconds
+    frameDelay @20 :Float32; # measured delay estimate used by this frame's inference/actions, seconds
+    actionDelay @21 :Float32; # half the filtered valid-publication interval used for lateral action lookahead, seconds
+  }
 
   lateralPlannerSolutionDEPRECATED @25: Deprecated.LateralPlannerSolution;
   leadsDEPRECATED @11 :List(LeadDataV2DEPRECATED);

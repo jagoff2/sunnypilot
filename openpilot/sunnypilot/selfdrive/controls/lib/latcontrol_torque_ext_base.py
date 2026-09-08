@@ -8,7 +8,6 @@ import math
 import numpy as np
 
 from openpilot.common.pid import PIDController
-from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
 LAT_PLAN_MIN_IDX = 5
@@ -96,14 +95,20 @@ class LatControlTorqueExtBase:
 
     # precompute time differences between ModelConstants.T_IDXS
     self.t_diffs = np.diff(ModelConstants.T_IDXS)
-    self.desired_lat_jerk_time = CP.steerActuatorDelay + LATERAL_LAG_MOD
+    self.desired_lat_jerk_time = 0.01
+    LatControlTorqueExtBase.update_lateral_lag(self, CP.steerActuatorDelay)
 
   def update_model_v2(self, model_v2):
     self.model_v2 = model_v2
-    self.model_valid = self.model_v2 is not None and len(self.model_v2.orientation.x) >= CONTROL_N
+    # Every array below is interpolated against the entire model time vector.
+    self.model_valid = model_v2 is not None and all(
+      len(values) == len(ModelConstants.T_IDXS) and np.isfinite(values).all()
+      for values in (model_v2.orientation.x, model_v2.orientation.y, model_v2.acceleration.y)
+    )
 
   def update_lateral_lag(self, lag):
-    self.desired_lat_jerk_time = max(0.01, lag) + LATERAL_LAG_MOD
+    if math.isfinite(lag):
+      self.desired_lat_jerk_time = max(0.01, lag) + LATERAL_LAG_MOD
 
   def update_friction_input(self, val_1, val_2):
     _error = val_1 - val_2
@@ -116,6 +121,7 @@ class LatControlTorqueExtBase:
     self.lateral_jerk_setpoint = 0.0
     self.lateral_jerk_measurement = 0.0
     self.lookahead_lateral_jerk = 0.0
+    self.lat_accel_friction_factor = 0.7
 
     actual_curvature_rate = -VM.calc_curvature(math.radians(CS.steeringRateDeg), CS.vEgo, 0.0)
     self.actual_lateral_jerk = actual_curvature_rate * CS.vEgo ** 2

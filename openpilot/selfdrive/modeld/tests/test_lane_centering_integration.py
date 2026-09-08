@@ -1,9 +1,12 @@
 import ast
 import copy
+import json
 import types
 import unittest
+from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
@@ -11,8 +14,15 @@ from openpilot.cereal import log
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, get_curvature_from_plan, should_stop, smooth_value
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
-from openpilot.selfdrive.modeld.lane_centering import ACTION_SMOOTH_SECONDS, CAMERA_OFFSET, ENTRY_TIME, RAMP_IN_TIME
-from openpilot.selfdrive.modeld.lane_centering_integration import LaneCenteringModelAdapter, update_lane_change_helpers
+from openpilot.selfdrive.modeld.lane_centering import (
+  ACTION_SMOOTH_SECONDS, CAMERA_OFFSET, ENTRY_TIME, MAX_LATERAL_ACCEL_CORRECTION, RAMP_IN_TIME, get_lane_centering_input_status,
+)
+from openpilot.selfdrive.modeld.lane_centering_integration import (
+  FRAME_DELAY_TAU, LaneCenteringModelAdapter, LaneCenteringTelemetry, ModelPublicationTiming,
+  TELEMETRY_MAX_TRANSITIONS, update_lane_change_helpers,
+)
+from openpilot.selfdrive.modeld.lane_centering_safety import LaneCenteringSafetyLatch
+from openpilot.selfdrive.modeld.lane_path import Corridor
 
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -70,7 +80,8 @@ def model_output():
   edges = lines[:, [1, 2]].copy()
   plan = np.zeros((1, n, ModelConstants.PLAN_WIDTH), dtype=np.float32)
   plan[0, :, Plan.POSITION.start] = 20 * np.asarray(ModelConstants.T_IDXS)
-  plan[0, :, Plan.POSITION.start + 1] = center
+  # A plan starts at the vehicle origin; the lane center can be offset.
+  plan[0, :, Plan.POSITION.start + 1] = 0.0
   plan[0, :, Plan.VELOCITY.start] = 20.0
   plan[0, :, Plan.ACCELERATION.start] = 0.3
   return {"plan": plan, "lane_lines": lines, "lane_lines_stds": np.full_like(lines, 0.05),
@@ -277,7 +288,9 @@ class TestLaneCenteringIntegration(unittest.TestCase):
             raw = get_curvature_from_plan(plan[:, Plan.T_FROM_CURRENT_EULER][:, 2],
                                           plan[:, Plan.ORIENTATION_RATE][:, 2], ModelConstants.T_IDXS, 20.0, 0.475)
             self.assertAlmostEqual(action.desiredCurvature, smooth_value(raw, previous, ACTION_SMOOTH_SECONDS), places=8)
-          self.assertTrue(saw_selected_exit)
+          # A blinker is immediate driver intent: stop selecting the lane path
+          # while keeping the selected-action smoothing history continuous.
+          self.assertEqual(saw_selected_exit, exit_kind == 'ordinary')
           self.assertTrue(saw_base_plan_fallback)
           self.assertEqual(status.authority, 0.0)
           inputs['carState'].leftBlinker = False
@@ -336,9 +349,381 @@ class TestLaneCenteringIntegration(unittest.TestCase):
         action_times = [node for node in ast.walk(main) if isinstance(node, ast.Assign) and
                         any(isinstance(target, ast.Name) and target.id == "lat_action_t" for target in node.targets)]
         self.assertEqual(ast.unparse(action_times[0].value), "lat_delay + frame_delay + action_delay")
+        frame_delays = [node for node in ast.walk(main) if isinstance(node, ast.Assign) and
+                        any(isinstance(target, ast.Name) and target.id == 'frame_delay' for target in node.targets)]
+        self.assertEqual(len(frame_delays), 1)
+        self.assertEqual(ast.unparse(frame_delays[0].value), 'lane_centering.frame_delay')
+        hold_delays = [node for node in ast.walk(main) if isinstance(node, ast.Assign) and
+                       any(isinstance(target, ast.Name) and target.id == 'action_delay' for target in node.targets)]
+        self.assertEqual(ast.unparse(hold_delays[0].value), 'lane_centering.action_delay')
+        long_horizons = [node for node in ast.walk(main) if isinstance(node, ast.Assign) and
+                         any(isinstance(target, ast.Name) and target.id == 'long_action_t' for target in node.targets)]
+        self.assertEqual(ast.unparse(long_horizons[0].value), 'long_delay + frame_delay + DT_MDL / 2')
         source = ast.unparse(main)
         self.assertLess(source.index('update_lane_change_helpers('), source.index('lane_centering.update('))
         self.assertIn('selected_model_output, action,', source)
+        self.assertLess(source.index('fill_model_msg('), source.index('lane_centering.fill_status('))
+        self.assertLess(source.index('fill_pose_msg('), source.index('lane_centering.fill_status('))
+        self.assertLess(source.index('lane_centering.fill_status('), source.rindex("pm.send('modelV2'"))
+
+  def test_nonmonotonic_camera_timestamps_reach_controller_as_invalid_elapsed_time(self):
+    native = native_actions()[0][1]
+    adapter, inputs, output = LaneCenteringModelAdapter(), Inputs(), model_output()
+    for timestamp, expected_dt in ((1_000_000_000, DT_MDL), (1_000_000_000, 0.0), (950_000_000, -0.05), (1_050_000_000, 0.05)):
+      with patch.object(adapter.controller, 'update', wraps=adapter.controller.update) as update:
+        adapter.update(output, native, inputs, True, log.LaneChangeState.off, timestamp, 20.0, 0.475, 0.475)
+      self.assertAlmostEqual(update.call_args.args[4], expected_dt)
+      self.assertEqual(adapter.frame_valid, expected_dt > 0)
+
+  def test_valid_frame_intervals_match_lateral_smoothing_and_capped_prediction(self):
+    for name, native in native_actions():
+      for mode in ('absolute', 'capped'):
+        for dt in (0.05, 0.10, 0.275):
+          with self.subTest(model=name, mode=mode, dt=dt):
+            adapter, inputs, output = LaneCenteringModelAdapter(mode), Inputs(), model_output()
+            self.run_frames(adapter, output, native, inputs, 40)
+            adapter.previous_base_action = log.ModelDataV2.Action(desiredCurvature=-0.0004, desiredAcceleration=0.4)
+            adapter.previous_selected_action = log.ModelDataV2.Action(desiredCurvature=0.001, desiredAcceleration=0.4)
+            previous_base = adapter.previous_base_action.desiredCurvature
+            previous_selected = adapter.previous_selected_action.desiredCurvature
+            expected_native = native(output, adapter.previous_base_action, 0.475, 0.475, 20.0, lateral_smooth_seconds=0.0)
+            core_status = []
+            update = adapter.controller.update
+
+            def capture(*args, update=update, core_status=core_status):
+              result = update(*args)
+              core_status.append(result[1])
+              return result
+
+            with patch.object(adapter.controller, 'update', side_effect=capture):
+              selected, action, status = self.run_frames(adapter, output, native, inputs, gap=dt)
+            plan = selected['plan'][0]
+            raw = get_curvature_from_plan(plan[:, Plan.T_FROM_CURRENT_EULER][:, 2], plan[:, Plan.ORIENTATION_RATE][:, 2],
+                                          ModelConstants.T_IDXS, 20.0, 0.475)
+            self.assertTrue(adapter.frame_valid)
+            self.assertFalse(status.safety_blocked)
+            self.assertAlmostEqual(adapter.previous_base_action.desiredCurvature,
+                                   smooth_value(0.0, previous_base, ACTION_SMOOTH_SECONDS, dt=dt), delta=1e-8)
+            self.assertAlmostEqual(action.desiredCurvature, smooth_value(raw, previous_selected, ACTION_SMOOTH_SECONDS, dt=dt), delta=1e-8)
+            self.assertAlmostEqual(core_status[0].curvature_correction,
+                                   action.desiredCurvature - adapter.previous_base_action.desiredCurvature, delta=1e-8)
+            self.assertAlmostEqual(core_status[0].requested_lateral_jerk,
+                                   abs(action.desiredCurvature - previous_selected) * 400.0 / dt, delta=1e-5)
+            self.assertEqual(action.desiredAcceleration, expected_native.desiredAcceleration)
+            self.assertEqual(action.shouldStop, expected_native.shouldStop)
+
+  def test_invalid_frame_intervals_do_not_advance_either_action_history(self):
+    native, inputs, output = native_actions()[0][1], Inputs(), model_output()
+    for dt in (0.0, -0.05, 0.35):
+      with self.subTest(dt=dt):
+        adapter = LaneCenteringModelAdapter('off')
+        adapter.last_timestamp_eof = 1_000_000_000
+        adapter.previous_base_action = log.ModelDataV2.Action(desiredCurvature=-0.004, desiredAcceleration=0.2)
+        adapter.previous_selected_action = log.ModelDataV2.Action(desiredCurvature=0.003, desiredAcceleration=0.2)
+        base, previous = adapter.previous_base_action, adapter.previous_selected_action
+        _, action, _ = self.run_frames(adapter, output, native, inputs, gap=dt)
+        self.assertFalse(adapter.frame_valid)
+        self.assertIs(adapter.previous_base_action, base)
+        self.assertIs(adapter.previous_selected_action, previous)
+        self.assertIs(action, previous)
+
+  def test_cold_engagement_consumes_preflight_decision_before_any_steering_authority(self):
+    native = native_actions()[0][1]
+    for narrow in (False, True):
+      with self.subTest(narrow=narrow):
+        adapter, inputs, output = LaneCenteringModelAdapter(), Inputs(), model_output()
+        inputs['carControl'].latActive = False
+        if narrow:
+          output['lane_lines'][0, 2, :, 0] = output['lane_lines'][0, 1, :, 0] + 1.0
+        _, action, status = self.run_frames(adapter, output, native, inputs)
+        self.assertEqual(status.authority, 0.0)
+        self.assertEqual(status.state, 'inactive')
+        self.assertEqual(status.containment, 'blocked' if narrow else 'contained')
+        model = log.ModelDataV2.new_message(frameId=1, timestampEof=adapter.last_timestamp_eof)
+        model.action = action
+        adapter.fill_status(model, status)
+        self.assertTrue(model.laneCentering.valid)
+        guard = LaneCenteringSafetyLatch()
+        now = model.timestampEof + 150_000_000
+        self.assertEqual(guard.update(model, True, True, now, False), narrow)
+        # A control tick may receive the enable request before the next model
+        # frame. It must already have a checked action or prohibit engagement.
+        self.assertEqual(guard.update(model, True, False, now, True), narrow)
+
+  def test_capped_mode_blocks_unsafe_handoff_that_requires_instant_full_path_weight(self):
+    native, output = native_actions()[0][1], model_output()
+    # Near-field policy agrees with the lane, but farther along the raw plan
+    # drifts a metre toward the right edge. The guard can replace it, but the
+    # first-frame capped authority slew cannot admit that full replacement.
+    plan = output['plan'][0]
+    u = np.clip((plan[:, Plan.POSITION.start] - 40.0) / 40.0, 0.0, 1.0)
+    slope = 30 * u**2 * (1 - u)**2 / 40.0
+    second = 60 * u * (1 - u) * (1 - 2*u) / 40.0**2
+    curvature = second / (1 + slope**2)**1.5
+    plan[:, Plan.POSITION.start + 1] = 10*u**3 - 15*u**4 + 6*u**5
+    plan[:, Plan.T_FROM_CURRENT_EULER.start + 2] = np.arctan(slope)
+    plan[:, Plan.ORIENTATION_RATE.start + 2] = 20.0 * curvature
+    plan[:, Plan.ACCELERATION.start + 1] = 400.0 * curvature
+    statuses = {}
+    for mode in ('absolute', 'capped'):
+      adapter = LaneCenteringModelAdapter(mode)
+      _, _, statuses[mode] = self.run_frames(adapter, output, native, Inputs())
+    self.assertFalse(statuses['absolute'].safety_blocked)
+    self.assertEqual(statuses['absolute'].containment, 'contained')
+    self.assertEqual(statuses['absolute'].path_weight, 1.0)
+    self.assertTrue(statuses['capped'].safety_blocked)
+    self.assertEqual(statuses['capped'].containment, 'blocked')
+    self.assertLess(statuses['capped'].path_weight, 1.0)
+
+  def test_full_weight_certificate_checks_exact_published_float32_array(self):
+    native, output = native_actions()[0][1], model_output()
+    adapter, inputs, _, _ = self.activate(output, native)
+    with patch.object(Corridor, 'check', autospec=True, side_effect=Corridor.check) as proofs:
+      selected, _, status = self.run_frames(adapter, output, native, inputs)
+    published = selected['plan']
+    self.assertFalse(status.safety_blocked)
+    self.assertEqual(status.path_weight, 1.0)
+    self.assertEqual(published.dtype, np.dtype(np.float32))
+    # The final array receives the full body proof after its publication cast.
+    # Reusing that same certificate later in this frame avoids duplicate work.
+    self.assertEqual(sum(call.args[1] is published for call in proofs.call_args_list), 1)
+    self.assertIs(adapter.controller.certified_plan, published)
+
+  def test_certificate_cannot_survive_into_next_frame_with_changed_boundaries(self):
+    native, output = native_actions()[0][1], model_output()
+    adapter, inputs, selected, _ = self.activate(output, native)
+    previously_certified = selected['plan']
+    self.assertIs(adapter.controller.certified_plan, previously_certified)
+    changed = copy.deepcopy(output)
+    # Reuse the identical array object, then change the road underneath it.
+    # A certificate keyed only by identity across frames would admit this path.
+    changed['plan'] = previously_certified
+    changed['lane_lines'][0, 2, :, 0] = changed['lane_lines'][0, 1, :, 0] + 1.0
+    with patch.object(Corridor, 'check', autospec=True, side_effect=Corridor.check) as proofs:
+      _, _, status = self.run_frames(adapter, changed, native, inputs)
+    self.assertTrue(any(call.args[1] is previously_certified for call in proofs.call_args_list))
+    self.assertTrue(status.safety_blocked)
+    self.assertEqual(status.containment, 'blocked')
+
+  def test_partial_capped_blend_receives_its_own_float32_body_proof(self):
+    native, output = native_actions()[0][1], model_output()
+    adapter, inputs = LaneCenteringModelAdapter('capped'), Inputs()
+    for _ in range(40):
+      _, _, status = self.run_frames(adapter, output, native, inputs)
+      if 0.0 < status.path_weight < 1.0:
+        break
+    else:
+      self.fail('fixture never reached partial path authority')
+    with patch.object(Corridor, 'check', autospec=True, side_effect=Corridor.check) as proofs:
+      selected, _, status = self.run_frames(adapter, output, native, inputs)
+    published, candidate = selected['plan'], adapter.controller.certified_plan
+    self.assertFalse(status.safety_blocked)
+    self.assertGreater(status.path_weight, 0.0)
+    self.assertLess(status.path_weight, 1.0)
+    self.assertEqual(published.dtype, np.dtype(np.float32))
+    self.assertIsNot(published, candidate)
+    self.assertTrue(any(call.args[1] is candidate for call in proofs.call_args_list))
+    self.assertTrue(any(call.args[1] is published for call in proofs.call_args_list))
+
+  def test_capped_weight_slew_cannot_restore_a_correction_above_hard_limit(self):
+    adapter, output = LaneCenteringModelAdapter('capped'), model_output()
+    controller = adapter.controller
+    speed, curvature = 30.0, 0.004
+    time = np.asarray(ModelConstants.T_IDXS)
+    model_x = np.asarray(ModelConstants.X_IDXS)
+    output['plan'][0, :, Plan.POSITION.start] = speed * time
+    output['plan'][0, :, Plan.VELOCITY.start] = speed
+    candidate = output['plan'].copy()
+    angle = curvature * speed * time
+    candidate[0, :, Plan.POSITION.start] = np.sin(angle) / curvature
+    candidate[0, :, Plan.POSITION.start + 1] = (1 - np.cos(angle)) / curvature
+    candidate[0, :, Plan.T_FROM_CURRENT_EULER.start + 2] = angle
+    candidate[0, :, Plan.ORIENTATION_RATE.start + 2] = curvature * speed
+    candidate[0, :, Plan.ACCELERATION.start + 1] = curvature * speed**2
+    center = 1 / curvature - np.sqrt((1 / curvature)**2 - model_x**2)
+    controller.corridor = Corridor(center - 1.8, center + 1.8)
+    controller.filtered_center_y = center
+    controller.state = 'active'
+    controller.authority = controller.last_policy_weight = controller.last_path_weight = 1.0
+    # Fix the feasible candidate to isolate selection, cap and slew ordering.
+    # The actual final trajectory still receives the complete body proof.
+    with patch.object(controller, '_build_lane_plan', return_value=(candidate, 1.0)):
+      _, status = controller._finish(output, speed, curvature, 0.475, 0.0, 0.0)
+    self.assertTrue(status.safety_blocked or abs(status.curvature_correction) <= MAX_LATERAL_ACCEL_CORRECTION / speed**2 + 1e-8)
+
+  def test_status_serialization_matches_source_frame_and_preserves_block(self):
+    adapter = LaneCenteringModelAdapter('off')
+    adapter.frame_valid = True
+    adapter.last_timestamp_eof = 1_000_000_000
+    adapter.execution_time = 0.025
+    fields = asdict(adapter.controller._status())
+    fields.update(containment='blocked', min_clearance=-0.2, response_time=1.5, checked_distance=62.5, safety_blocked=True)
+    status = SimpleNamespace(**fields)
+    model = log.ModelDataV2.new_message(frameId=9, timestampEof=adapter.last_timestamp_eof)
+    with patch('openpilot.selfdrive.modeld.lane_centering_integration.model_clock_ns', return_value=1_080_000_000):
+      adapter.fill_status(model, status)
+    self.assertEqual(model.laneCentering.version, 1)
+    self.assertTrue(model.laneCentering.valid)
+    self.assertEqual(model.laneCentering.frameId, model.frameId)
+    self.assertEqual(model.laneCentering.timestampEof, model.timestampEof)
+    self.assertTrue(model.laneCentering.safetyBlocked)
+    self.assertAlmostEqual(model.laneCentering.minClearance, -0.2)
+    self.assertAlmostEqual(model.laneCentering.checkedDistance, 62.5)
+    self.assertAlmostEqual(model.laneCentering.responseTime, 1.5)
+    self.assertAlmostEqual(model.laneCentering.executionTime, 0.025)
+    self.assertAlmostEqual(model.laneCentering.publishAge, 0.080)
+    self.assertAlmostEqual(model.laneCentering.frameDelay, DT_MDL)
+    self.assertAlmostEqual(model.laneCentering.actionDelay, DT_MDL / 2)
+    self.assertGreater(adapter.frame_delay, DT_MDL)
+    model.timestampEof += 1
+    adapter.fill_status(model, status)
+    self.assertFalse(model.laneCentering.valid)
+
+  def test_invalid_plans_and_actions_preserve_finite_history_and_recover(self):
+    for name, native in native_actions():
+      for fault in ('missing_plan', 'plan_shape', 'nan_plan', 'nan_accel', 'nan_action', 'action_shape'):
+        with self.subTest(model=name, fault=fault):
+          adapter, inputs, output = LaneCenteringModelAdapter('off'), Inputs(), model_output()
+          adapter.previous_base_action = log.ModelDataV2.Action(desiredCurvature=-0.003, desiredAcceleration=0.4)
+          adapter.previous_selected_action = log.ModelDataV2.Action(desiredCurvature=0.004, desiredAcceleration=0.4)
+          invalid = copy.deepcopy(output)
+          if fault == 'missing_plan':
+            del invalid['plan']
+          elif fault == 'plan_shape':
+            invalid['plan'] = np.zeros((1, 2, 3), dtype=np.float32)
+          elif fault == 'nan_plan':
+            invalid['plan'][0, 3, Plan.T_FROM_CURRENT_EULER.start + 2] = np.nan
+          else:
+            invalid['action'] = np.array([[0.0, 0.1]], dtype=np.float32)
+            if fault == 'nan_accel':
+              invalid['action'][0, 1] = np.nan
+            elif fault == 'nan_action':
+              invalid['action'][0, 0] = np.nan
+            else:
+              invalid['action'] = np.zeros((0,), dtype=np.float32)
+          selected, action, status = self.run_frames(adapter, invalid, native, inputs)
+          self.assertIs(selected, invalid)
+          self.assertFalse(adapter.frame_valid)
+          self.assertTrue(status.safety_blocked)
+          self.assertEqual(status.reason, 'invalid_action')
+          self.assertAlmostEqual(adapter.previous_base_action.desiredCurvature, -0.003)
+          self.assertAlmostEqual(adapter.previous_selected_action.desiredCurvature, 0.004)
+          self.assertAlmostEqual(action.desiredAcceleration, 0.4)
+          message = log.Event.new_message()
+          message.init('modelV2')
+          adapter.fill_invalid_model(message, action, status, 4, adapter.last_timestamp_eof)
+          self.assertFalse(message.valid)
+          self.assertFalse(message.modelV2.laneCentering.valid)
+          self.assertTrue(message.modelV2.laneCentering.safetyBlocked)
+          self.assertEqual(len(message.modelV2.position.x), 0)
+          self.assertEqual(message.modelV2.frameId, 4)
+          _, action, status = self.run_frames(adapter, output, native, inputs)
+          self.assertTrue(adapter.frame_valid)
+          self.assertFalse(status.safety_blocked)
+          self.assertAlmostEqual(action.desiredCurvature, smooth_value(0.0, 0.004, ACTION_SMOOTH_SECONDS), places=8)
+          self.assertTrue(np.isfinite(adapter.previous_base_action.desiredAcceleration))
+
+
+class TestModelPublicationTiming(unittest.TestCase):
+  def test_lateral_hold_uses_valid_publication_cadence(self):
+    adapter = LaneCenteringModelAdapter()
+    timing = adapter.timing
+    self.assertEqual(adapter.action_delay, DT_MDL / 2)
+    for frame in range(21):
+      timestamp = 1_000_000_000 + frame * 100_000_000
+      timing.observe(timestamp, timestamp + 70_000_000)
+    expected = 0.100 + (DT_MDL - 0.100) * np.exp(-20 * 0.100 / FRAME_DELAY_TAU)
+    self.assertAlmostEqual(adapter.action_delay, expected / 2, places=12)
+    previous = timing.publication_interval
+    timing.observe(3_050_000_000, 3_120_000_000, valid=False)
+    self.assertEqual(timing.publication_interval, previous)
+    # The next accepted command follows a100ms gap, despite an invalid model
+    # message arriving in between. Measure command cadence, not message count.
+    timing.observe(3_100_000_000, 3_170_000_000)
+    self.assertAlmostEqual(timing.publication_interval,
+                           previous + (1 - np.exp(-0.100 / FRAME_DELAY_TAU)) * (0.100 - previous), places=12)
+
+  def test_complete_age_replaces_fixed_delay_without_double_counting(self):
+    timing = ModelPublicationTiming()
+    self.assertEqual(timing.frame_delay, DT_MDL)
+    for frame in range(31):
+      timestamp = 1_000_000_000 + frame * 50_000_000
+      self.assertAlmostEqual(timing.observe(timestamp, timestamp + 70_000_000), 0.070)
+    expected = 0.070 + (DT_MDL - 0.070) * np.exp(-31 * DT_MDL / FRAME_DELAY_TAU)
+    self.assertAlmostEqual(timing.frame_delay, expected, places=12)
+    self.assertLess(abs(timing.frame_delay - 0.070), 0.001)
+
+  def test_invalid_source_age_order_and_gaps_do_not_train_delay(self):
+    timing = ModelPublicationTiming()
+    timing.observe(1_000_000_000, 1_070_000_000)
+    previous = timing.frame_delay
+    for timestamp, age in ((0, 0), (1_000_000_000, 0.1), (950_000_000, 0.1),
+                           (1_050_000_000, -0.001), (1_100_000_000, 0.301), (2_000_000_000, 0.08)):
+      with self.subTest(timestamp=timestamp, age=age):
+        timing.observe(timestamp, timestamp + round(age * 1e9))
+        self.assertEqual(timing.frame_delay, previous)
+    timing.observe(2_050_000_000, 2_130_000_000)
+    self.assertGreater(timing.frame_delay, previous)
+    self.assertLess(timing.frame_delay, 0.080)
+
+  def test_camera_phase_jitter_is_smoothed(self):
+    timing, estimates = ModelPublicationTiming(), []
+    for frame in range(80):
+      timestamp = 1_000_000_000 + frame * 50_000_000
+      timing.observe(timestamp, timestamp + (40_000_000 if frame % 2 == 0 else 80_000_000))
+      if frame >= 60:
+        estimates.append(timing.frame_delay)
+    self.assertLess(np.ptp(estimates), 0.003)
+    self.assertAlmostEqual(float(np.mean(estimates)), 0.060, delta=0.0001)
+
+
+class TestLaneCenteringTelemetry(unittest.TestCase):
+  def test_structured_events_preserve_original_and_selected_geometry_and_valid_json(self):
+    adapter, output, inputs = LaneCenteringModelAdapter('off'), model_output(), Inputs()
+    selected = copy.deepcopy(output)
+    selected['plan'][0, :, Plan.POSITION.start + 1] += 0.3
+    telemetry = LaneCenteringTelemetry(clock=lambda: 0.0)
+    with patch('openpilot.selfdrive.modeld.lane_centering_integration.cloudlog.event') as event:
+      telemetry.update('off', adapter.controller._status(), get_lane_centering_input_status(inputs, True),
+                       output, selected, 1_000_000_000, DT_MDL, 20.0, 0.001, 0.002)
+    self.assertEqual(event.call_args.args, ('lane_centering_status',))
+    payload = event.call_args.kwargs
+    json.dumps(payload, allow_nan=False)
+    self.assertNotIn('error', payload)
+    self.assertIsNone(payload['status']['lane_width'])
+    self.assertEqual(payload['timestamp_eof'], 1_000_000_000)
+    self.assertEqual(payload['transitions'][0]['mode'], 'off')
+    self.assertIsNone(payload['transitions'][0]['min_clearance_m'])
+    self.assertEqual(payload['transitions'][0]['checked_distance_m'], 0.0)
+    geometry = payload['geometry']
+    self.assertEqual(len(geometry['sample_x_m']), 5)
+    self.assertNotEqual(geometry['original_path_y_m'], geometry['selected_path_y_m'])
+    self.assertGreater(geometry['original_sampled_min_line_axis_aligned_body_margin_m'],
+                       geometry['selected_sampled_min_line_axis_aligned_body_margin_m'])
+
+  def test_transition_churn_is_bounded_and_health_heartbeat_is_periodic(self):
+    now = [0.0]
+    telemetry, output = LaneCenteringTelemetry(clock=lambda: now[0]), model_output()
+    status = LaneCenteringModelAdapter('off').controller._status()
+    inputs = get_lane_centering_input_status(Inputs(), True)
+    with patch('openpilot.selfdrive.modeld.lane_centering_integration.cloudlog.event') as event:
+      for i in range(40):
+        status = replace(status, entry_gate=str(i % 2))
+        telemetry.update('off', status, inputs, output, output, i + 1, DT_MDL, 20.0, 0.0, 0.0)
+      self.assertEqual(event.call_count, 1)
+      self.assertEqual(len(telemetry.transitions), TELEMETRY_MAX_TRANSITIONS)
+      now[0] = 0.5
+      telemetry.update('off', status, inputs, output, output, 41, DT_MDL, 20.0, 0.0, 0.0)
+      self.assertEqual(event.call_count, 2)
+      self.assertEqual(len(event.call_args.kwargs['transitions']), TELEMETRY_MAX_TRANSITIONS)
+      self.assertGreater(event.call_args.kwargs['dropped_transitions'], 0)
+      now[0] = 5.4
+      telemetry.update('off', status, inputs, output, output, 42, DT_MDL, 20.0, 0.0, 0.0)
+      self.assertEqual(event.call_count, 2)
+      now[0] = 5.5
+      telemetry.update('off', status, inputs, output, output, 43, DT_MDL, 20.0, 0.0, 0.0)
+      self.assertEqual(event.call_count, 3)
+      self.assertEqual(event.call_args.kwargs['transitions'], [])
 
   def test_relc_values_and_current_frame_desire_precede_selection(self):
     output, events = model_output(), []

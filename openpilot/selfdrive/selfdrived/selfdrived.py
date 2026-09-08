@@ -22,6 +22,7 @@ from openpilot.selfdrive.selfdrived.events import Events, ET
 from openpilot.selfdrive.selfdrived.helpers import ExcessiveActuationCheck
 from openpilot.selfdrive.selfdrived.state import StateMachine
 from openpilot.selfdrive.selfdrived.alertmanager import AlertManager, set_offroad_alert
+from openpilot.selfdrive.modeld.lane_centering_safety import LaneCenteringSafetyLatch, model_clock_ns
 
 from openpilot.common.version import get_build_metadata
 from openpilot.common.hardware import HARDWARE
@@ -84,6 +85,7 @@ class SelfdriveD(CruiseHelper):
     self.excessive_actuation_check = ExcessiveActuationCheck()
     self.excessive_actuation = self.params.get("Offroad_ExcessiveActuation") is not None
     self.model_availability = ModelAvailability()
+    self.lane_centering_safety = LaneCenteringSafetyLatch()
 
     # Setup sockets
     self.pm = messaging.PubMaster(['selfdriveState', 'onroadEvents'] + ['selfdriveStateSP', 'onroadEventsSP'])
@@ -197,6 +199,20 @@ class SelfdriveD(CruiseHelper):
     if alerts.ready:
       self.events_sp.add(custom.OnroadEventSP.EventName.bigModelReady)
 
+  def update_lane_centering_events(self):
+    maneuver_active = self.sm.seen['lateralManeuverPlan'] and self.sm.all_checks(['lateralManeuverPlan'])
+    if maneuver_active or self.sm['controlsState'].lateralControlState.which() == 'debugState':
+      return
+    engagement_requested = self.mads.enabled if self.mads.enabled_toggle else self.enabled
+    blocked = self.lane_centering_safety.update(
+      self.sm['modelV2'], self.sm.seen['modelV2'] and self.sm.all_alive(['modelV2']) and self.sm.all_valid(['modelV2']),
+      self.sm.updated['modelV2'], model_clock_ns(), engagement_requested,
+    )
+    if blocked:
+      # Existing immediate-disable handling also disengages longitudinal control
+      # and MADS. No blind return to the policy path while steering is requested.
+      self.events.add(EventName.laneCenteringUnavailable)
+
   def update_events(self, CS):
     """Compute onroadEvents from carState"""
 
@@ -233,6 +249,8 @@ class SelfdriveD(CruiseHelper):
     # Don't add any more events while in dashcam mode
     if self.CP.passive:
       return
+
+    self.update_lane_centering_events()
 
     # Block resume if cruise never previously enabled
     resume_pressed = any(be.type in (ButtonType.accelCruise, ButtonType.resumeCruise) for be in CS.buttonEvents)

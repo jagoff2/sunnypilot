@@ -1,0 +1,21 @@
+{
+  "provenance": "Sanitized steering-unwind snapshot; matched control-model state and preceding CAN rate; fixed replay pitch estimate 0.03768 rad",
+  "speed": 21.15508460998535,
+  "desired_lateral_accel": 1.0125991106033325,
+  "setpoint": 1.0145764927931316,
+  "measurement": 1.2505940758349219,
+  "roll": 0.022180133881312368,
+  "past_future_rolls": [
+    0.036547349452487755,
+    0.03139605756089427,
+    0.02652373343571603,
+    -0.00037422692741015693,
+    -0.010693368977923532,
+    -0.023468504641806026,
+    -0.03716664646875179
+  ],
+  "jerk_setpoint": -0.03975723380940457,
+  "jerk_measurement": -1.3112796068289365,
+  "p_logged": 0.17118167877197266,
+  "p_reconstructed": 0.1712150275707245
+}

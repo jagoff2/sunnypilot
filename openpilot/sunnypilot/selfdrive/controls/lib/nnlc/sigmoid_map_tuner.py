@@ -123,6 +123,11 @@ class SigmoidMapTuner:
   # ---------------------------------------------------------------------------
   # Public API
   # ---------------------------------------------------------------------------
+  def update_context(self, CS, roll_compensation: float) -> None:
+    self._current_speed = CS.vEgo
+    self._current_longitudinal_accel = CS.aEgo
+    self._current_roll_compensation = roll_compensation
+
   def observe(self,
               enabled: bool,
               CS,
@@ -132,9 +137,7 @@ class SigmoidMapTuner:
               output_torque: float,
               steer_limited: bool,
               roll_compensation: float) -> None:
-    self._current_speed = CS.vEgo
-    self._current_longitudinal_accel = CS.aEgo
-    self._current_roll_compensation = roll_compensation
+    self.update_context(CS, roll_compensation)
 
     if self._frozen_from_disk:
       return

@@ -20,6 +20,7 @@ from openpilot.selfdrive.controls.lib.latcontrol_curvature import LatControlCurv
 from openpilot.selfdrive.controls.lib.latcontrol_torque import LatControlTorque
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 from openpilot.selfdrive.modeld.modeld import LAT_SMOOTH_SECONDS
+from openpilot.selfdrive.modeld.lane_centering_safety import LaneCenteringSafetyLatch, model_clock_ns
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose
 
 from openpilot.sunnypilot.selfdrive.controls.controlsd_ext import ControlsExt
@@ -52,6 +53,7 @@ class Controls(ControlsExt):
     self.steer_limited_by_safety = False
     self.curvature = 0.0
     self.desired_curvature = 0.0
+    self.lane_centering_safety = LaneCenteringSafetyLatch()
 
     self.pose_calibrator = PoseCalibrator()
     self.calibrated_pose: Pose | None = None
@@ -114,8 +116,15 @@ class Controls(ControlsExt):
 
     # Get which state to use for active lateral control
     _lat_active = self.get_lat_active(self.sm)
+    maneuver_active = self.sm.seen['lateralManeuverPlan'] and self.sm.all_checks(['lateralManeuverPlan'])
+    mads = self.sm['selfdriveStateSP'].mads
+    engagement_requested = mads.enabled if mads.available else self.sm['selfdriveState'].enabled
+    planner_blocked = False if maneuver_active else self.lane_centering_safety.update(
+      model_v2, self.sm.seen['modelV2'] and self.sm.all_alive(['modelV2']) and self.sm.all_valid(['modelV2']),
+      self.sm.updated['modelV2'], model_clock_ns(), engagement_requested,
+    )
 
-    CC.latActive = _lat_active and not CS.steerFaultTemporary and not CS.steerFaultPermanent and \
+    CC.latActive = _lat_active and not planner_blocked and not CS.steerFaultTemporary and not CS.steerFaultPermanent and \
                    (not standstill or self.CP.steerAtStandstill)
     CC.longActive = CC.enabled and not any(e.overrideLongitudinal for e in self.sm['onroadEvents']) and \
                     (self.CP.openpilotLongitudinalControl or not self.CP_SP.pcmCruiseSpeed)
@@ -139,7 +148,7 @@ class Controls(ControlsExt):
 
     # Steering PID loop and lateral MPC
     # Reset desired curvature to current to avoid violating the limits on engage
-    if self.sm.valid['lateralManeuverPlan']:
+    if maneuver_active:
       new_desired_curvature = self.sm['lateralManeuverPlan'].desiredCurvature if CC.latActive else self.curvature
     else:
       new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature

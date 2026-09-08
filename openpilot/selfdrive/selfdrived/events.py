@@ -239,6 +239,11 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
     ET.PERMANENT: NormalPermanentAlert("Driving Model Unavailable", "Waiting for healthy model output"),
   },
 
+  EventName.laneCenteringUnavailable: {
+    ET.NO_ENTRY: NoEntryAlert("Lateral Planning Unavailable"),
+    ET.IMMEDIATE_DISABLE: ImmediateDisableAlert("Lateral Planning Unavailable"),
+  },
+
   EventName.lateralManeuver: {
     ET.WARNING: longitudinal_maneuver_alert,
     ET.PERMANENT: NormalPermanentAlert("Lateral Maneuver Mode"),
