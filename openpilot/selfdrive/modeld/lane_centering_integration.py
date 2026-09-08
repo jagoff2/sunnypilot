@@ -185,8 +185,9 @@ def update_lane_change_helpers(model_output, car_state, lat_active, v_ego, desir
 
 
 class LaneCenteringModelAdapter:
-  def __init__(self, mode="absolute"):
+  def __init__(self, mode="absolute", worker=None):
     self.mode = mode
+    self.worker = worker
     self.controller = LaneCenteringController(mode)
     self.previous_base_action = log.ModelDataV2.Action()
     self.previous_selected_action = log.ModelDataV2.Action()
@@ -226,7 +227,7 @@ class LaneCenteringModelAdapter:
     return self.timing.publication_interval / 2
 
   def update(self, model_output, action_from_model, sm, calibration_seen, lane_change_state,
-             timestamp_eof, v_ego, lat_action_t, long_action_t):
+             timestamp_eof, v_ego, lat_action_t, long_action_t, planner_deadline=None):
     execution_start = time.perf_counter()
     model_output = normalize_model_plan(model_output)
     self.auxiliary_valid = True
@@ -263,7 +264,9 @@ class LaneCenteringModelAdapter:
     # one selected filter history through acquisition, release and base-plan fallback.
     curvature = math.nan
     try:
-      selected_output, status = self.controller.update(
+      compute = self.controller.update if self.worker is None else lambda *args: self.worker.run(
+        self.controller.update, *args, deadline=planner_deadline)
+      selected_output, status = compute(
         model_output, v_ego, sm['carControl'].currentCurvature, lat_action_t, frame_dt,
         base_action.desiredCurvature, self.previous_selected_action.desiredCurvature,
         sm['carControl'].latActive, inputs.ready and action_valid, sm['carState'].leftBlinker, sm['carState'].rightBlinker,
@@ -315,6 +318,9 @@ class LaneCenteringModelAdapter:
                               'adapter_output_age_s': _finite_number((model_clock_ns() - timestamp_eof) * 1e-9),
                               'frame_delay_s': _finite_number(self.frame_delay),
                               'lateral_action_delay_s': _finite_number(self.action_delay),
+                              'planner_worker_compute_s': self.worker.last_compute_time if self.worker is not None else None,
+                              'planner_worker_queue_s': self.worker.last_queue_time if self.worker is not None else None,
+                              'planner_worker_timeouts': self.worker.timeouts if self.worker is not None else 0,
                             })
     except Exception:
       # Reporting must not stop inference or recursively use a broken logger.

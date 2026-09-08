@@ -1,0 +1,272 @@
+import copy
+import math
+import os
+import select
+import signal
+import tempfile
+import time
+import unittest
+from dataclasses import asdict
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+import numpy as np
+
+from openpilot.cereal import log
+from openpilot.common.realtime import DT_MDL
+from openpilot.selfdrive.modeld.lane_centering import LaneCenteringController
+from openpilot.selfdrive.modeld.lane_centering_integration import LaneCenteringModelAdapter
+from openpilot.selfdrive.modeld.lane_centering_worker import LanePlannerBusy, LanePlannerWorker, MAX_PACKET_BYTES
+from openpilot.selfdrive.modeld.tests.test_lane_centering_integration import Inputs, model_output, native_actions
+
+
+def native(snapshot):
+  return snapshot, os.getpid()
+
+
+def selected(snapshot):
+  return {**snapshot, 'plan': snapshot['plan'] + 3}, 'selected'
+
+
+def fail(snapshot=None):
+  raise ValueError('injected optional failure')
+
+
+def delayed(snapshot, started, release, observed):
+  Path(started).touch()
+  while not Path(release).exists():
+    time.sleep(.001)
+  Path(observed).write_text(str(snapshot['plan'][0]))
+  return snapshot, None
+
+
+class DelayedController(LaneCenteringController):
+  def update(self, *args):
+    delayed({'plan': [0]}, self.started, self.release, self.observed)
+    return super().update(*args)
+
+
+class TestLanePlannerWorker(unittest.TestCase):
+  def make_worker(self, **kwargs):
+    worker = LanePlannerWorker(**{'timeout': 1., **kwargs})
+    self.addCleanup(worker.close)
+    worker.wait_ready(timeout=10.)
+    return worker
+
+  def test_process_identity_native_identity_and_selected_snapshot(self):
+    worker = self.make_worker()
+    original = {'plan': np.arange(12)}
+    self.assertIs(worker.run(native, original)[0], original)
+    self.assertNotEqual(worker.run(native, original)[1], os.getpid())
+    result, status = worker.run(selected, original)
+    self.assertEqual(status, 'selected')
+    np.testing.assert_array_equal(result['plan'], original['plan'] + 3)
+    np.testing.assert_array_equal(original['plan'], np.arange(12))
+    self.assertGreaterEqual(worker.last_compute_time, 0)
+    self.assertGreaterEqual(worker.last_queue_time, 0)
+
+  def test_timeout_snapshot_busy_and_late_discard(self):
+    worker = self.make_worker(timeout=.05)
+    with tempfile.TemporaryDirectory() as directory:
+      started, release, observed = [str(Path(directory) / name) for name in ('started', 'release', 'observed')]
+      original = {'plan': np.arange(12)}
+      with self.assertRaises(TimeoutError):
+        worker.run(delayed, original, started, release, observed)
+      until = time.monotonic() + 2.
+      while not Path(started).exists() and time.monotonic() < until:
+        time.sleep(.001)
+      self.assertTrue(Path(started).exists())
+      original['plan'][0] = 99
+      before = time.monotonic()
+      with self.assertRaises(LanePlannerBusy):
+        worker.run(native, original)
+      self.assertLess(time.monotonic() - before, .05)
+      Path(release).touch()
+      self.assertTrue(select.select([worker._channel], [], [], 2.)[0])
+      worker.timeout = 1.
+      self.assertIs(worker.run(native, original)[0], original)
+      self.assertEqual(Path(observed).read_text(), '0')
+      self.assertEqual(worker.timeouts, 1)
+
+  def test_stopped_worker_cannot_block_parent_deadline(self):
+    worker = self.make_worker(timeout=.02)
+    os.kill(worker._process.pid, signal.SIGSTOP)
+    try:
+      before = time.monotonic()
+      with self.assertRaises(TimeoutError):
+        worker.run(native, {})
+      self.assertLess(time.monotonic() - before, .15)
+      with self.assertRaises(LanePlannerBusy):
+        worker.run(native, {})
+    finally:
+      os.kill(worker._process.pid, signal.SIGCONT)
+
+  def test_failed_initializer_and_failed_computation(self):
+    worker = LanePlannerWorker(initialize=fail)
+    self.addCleanup(worker.close)
+    with self.assertRaises(RuntimeError):
+      worker.wait_ready(timeout=10.)
+    with self.assertRaises(RuntimeError):
+      worker.run(native, {})
+    worker = self.make_worker()
+    with self.assertRaisesRegex(RuntimeError, 'ValueError'):
+      worker.run(fail, {})
+    self.assertIsNotNone(worker.run(native, {})[1])
+
+  def test_startup_transport_and_spawn_failures_are_optional(self):
+    for target in ('socket.socketpair', 'multiprocessing.get_context'):
+      with self.subTest(target=target), patch('openpilot.selfdrive.modeld.lane_centering_worker.' + target,
+                                            side_effect=OSError('injected startup failure')):
+        worker = LanePlannerWorker()
+        self.addCleanup(worker.close)
+        with self.assertRaises(RuntimeError):
+          worker.run(native, {})
+
+  def test_oversize_packets_deadline_and_invalid_timeout(self):
+    worker = self.make_worker()
+    with self.assertRaises(ValueError):
+      worker.run(native, {'payload': bytes(MAX_PACKET_BYTES)})
+    with self.assertRaises(TimeoutError):
+      worker.run(native, {}, deadline=time.monotonic() - 1)
+    self.assertIsNotNone(worker.run(native, {})[1])
+    for timeout in (0., -1., math.nan, math.inf):
+      with self.assertRaises(ValueError):
+        LanePlannerWorker(timeout=timeout)
+
+  def test_worker_exit_and_close(self):
+    worker = self.make_worker()
+    worker._process.kill()
+    worker._process.join(timeout=1.)
+    with self.assertRaises((RuntimeError, OSError)):
+      worker.run(native, {})
+    worker.close()
+    worker.close()
+    with self.assertRaisesRegex(RuntimeError, 'closed'):
+      worker.run(native, {})
+
+  def test_close_kills_a_stopped_child_without_waiting_indefinitely(self):
+    worker = self.make_worker()
+    os.kill(worker._process.pid, signal.SIGSTOP)
+    before = time.monotonic()
+    worker.close()
+    self.assertLess(time.monotonic() - before, .75)
+    self.assertFalse(worker._process.is_alive())
+class TestLanePlannerWorkerIntegration(unittest.TestCase):
+  def make_adapter(self, **kwargs):
+    worker = LanePlannerWorker(**{'timeout': 1.0, **kwargs})
+    self.addCleanup(worker.close)
+    worker.wait_ready(timeout=10.)
+    adapter = LaneCenteringModelAdapter(worker=worker)
+    # Keep transport and geometry telemetry out of this execution parity test.
+    adapter.telemetry.update = Mock()
+    return adapter
+
+  def frame(self, adapter, original, native, inputs, calibration=True, gap=DT_MDL):
+    timestamp = (adapter.last_timestamp_eof or 1_000_000_000) + round(gap * 1e9)
+    return adapter.update(original, native, inputs, calibration, log.LaneChangeState.off, timestamp, 20.0, 0.475, 0.475)
+
+  def assert_status_equal(self, actual, expected):
+    for key, value in asdict(expected).items():
+      if isinstance(value, float) and math.isnan(value):
+        self.assertTrue(math.isnan(getattr(actual, key)), key)
+      else:
+        self.assertEqual(getattr(actual, key), value, key)
+
+  def test_worker_matches_synchronous_trajectory_action_and_status_across_phases(self):
+    for name, native in native_actions():
+      with self.subTest(model=name):
+        worker_adapter = self.make_adapter()
+        sync_adapter = LaneCenteringModelAdapter()
+        sync_adapter.telemetry.update = Mock()
+        inputs = Inputs()
+        phases = set()
+        # Acquisition, full authority, boundary hold/release, re-acquisition,
+        # and a turn-signal release all retain matching frame/action histories.
+        for calibration, lane_prob, blinker, frames in ((False, 0.95, False, 3), (True, 0.95, False, 45),
+                                                       (True, 0.0, False, 45), (True, 0.95, False, 45),
+                                                       (True, 0.95, True, 25)):
+          inputs['carState'].leftBlinker = blinker
+          for _ in range(frames):
+            original = model_output()
+            original['action'] = np.array([[2.4, -1.25]], dtype=np.float32)
+            original['lane_lines_prob'][:] = lane_prob
+            untouched = copy.deepcopy(original)
+            expected = self.frame(sync_adapter, original, native, inputs, calibration)
+            actual = self.frame(worker_adapter, original, native, inputs, calibration)
+            phases.add(actual[2].state)
+            self.assertEqual(actual[0] is original, expected[0] is original)
+            self.assertEqual(actual[0].keys(), expected[0].keys())
+            for key in original:
+              np.testing.assert_array_equal(actual[0][key], expected[0][key], err_msg=key)
+              np.testing.assert_array_equal(original[key], untouched[key], err_msg=key)
+            self.assertEqual(actual[1].to_dict(), expected[1].to_dict())
+            self.assert_status_equal(actual[2], expected[2])
+            self.assertEqual(worker_adapter.frame_valid, sync_adapter.frame_valid)
+            self.assertTrue(worker_adapter.auxiliary_valid)
+        self.assertTrue({'inactive', 'acquiring', 'active', 'exiting'} <= phases, phases)
+        self.assertEqual(worker_adapter.telemetry_failures, 0)
+
+
+
+  def test_timeout_resets_authority_and_preserves_failure_telemetry(self):
+    adapter = self.make_adapter()
+    inputs, original = Inputs(), model_output()
+    function = native_actions()[0][1]
+    for _ in range(45):
+      _, _, status = self.frame(adapter, original, function, inputs)
+    self.assertEqual(status.state, 'active')
+    with tempfile.TemporaryDirectory() as directory:
+      controller = DelayedController('absolute')
+      controller.__dict__.update(adapter.controller.__dict__)
+      controller.started, controller.release, controller.observed = [str(Path(directory) / name)
+                                                                     for name in ('started', 'release', 'observed')]
+      adapter.controller = controller
+      adapter.worker.timeout = .05
+      result, action, status = self.frame(adapter, original, function, inputs)
+      self.assertIs(result, original)
+      self.assertTrue(adapter.frame_valid)
+      self.assertFalse(adapter.auxiliary_valid)
+      self.assertEqual(adapter.last_optional_error, 'TimeoutError')
+      self.assertEqual(action.desiredCurvature, adapter.previous_base_action.desiredCurvature)
+      self.assertTrue(status.policy_fallback)
+      self.assertFalse(status.collision_risk)
+      self.assertIsNot(adapter.controller, controller)
+      self.assertEqual(adapter.controller.authority, 0.)
+      timing = adapter.telemetry.update.call_args.kwargs['timing']
+      self.assertIsNone(timing['planner_worker_compute_s'])
+      self.assertEqual(adapter.telemetry_failures, 0)
+      self.frame(adapter, original, function, inputs)
+      self.assertEqual(adapter.last_optional_error, 'LanePlannerBusy')
+      reset = adapter.controller
+      history = adapter.previous_selected_action.to_dict()
+      Path(controller.release).touch()
+      self.assertTrue(select.select([adapter.worker._channel], [], [], 2.)[0])
+      self.assertIs(adapter.controller, reset)
+      self.assertEqual(adapter.previous_selected_action.to_dict(), history)
+      self.assertEqual(reset.authority, 0.)
+      adapter.worker.timeout = 1.
+      _, _, status = self.frame(adapter, original, function, inputs)
+      self.assertEqual(status.authority, 0.)
+      for _ in range(45):
+        _, _, status = self.frame(adapter, original, function, inputs)
+      self.assertEqual(status.state, 'active')
+
+  def test_worker_failure_cannot_validate_bad_native_frame(self):
+    for fault in ('plan', 'duplicate_timestamp'):
+      with self.subTest(fault=fault):
+        adapter, original, inputs = self.make_adapter(), model_output(), Inputs()
+        function = native_actions()[0][1]
+        self.frame(adapter, original, function, inputs)
+        history = adapter.previous_base_action
+        if fault == 'plan':
+          original['plan'][0, 3, 1] = math.nan
+        adapter.worker._process.kill()
+        adapter.worker._process.join(timeout=1.)
+        self.frame(adapter, original, function, inputs, gap=0. if fault == 'duplicate_timestamp' else DT_MDL)
+        self.assertFalse(adapter.frame_valid)
+        self.assertFalse(adapter.auxiliary_valid)
+        self.assertIs(adapter.previous_base_action, history)
+
+
+if __name__ == '__main__':
+  unittest.main()
