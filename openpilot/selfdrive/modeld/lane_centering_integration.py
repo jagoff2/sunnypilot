@@ -295,25 +295,27 @@ class LaneCenteringModelAdapter:
     selected.state = status.state
     selected.source = status.source
     selected.reason = status.reason
-    selected.authority = status.authority
-    selected.pathWeight = status.path_weight
+    # Geometry calculations may produce NumPy scalars. pycapnp requires native
+    # Python scalars even when their values are valid for the schema field.
+    selected.authority = float(status.authority)
+    selected.pathWeight = float(status.path_weight)
     selected.containment = status.containment
-    selected.minClearance = status.min_clearance
-    selected.responseTime = status.response_time
-    selected.checkedDistance = status.checked_distance
-    selected.safetyBlocked = status.safety_blocked
-    selected.collisionRisk = status.collision_risk
-    selected.policyFallback = status.policy_fallback
+    selected.minClearance = float(status.min_clearance)
+    selected.responseTime = float(status.response_time)
+    selected.checkedDistance = float(status.checked_distance)
+    selected.safetyBlocked = bool(status.safety_blocked)
+    selected.collisionRisk = bool(status.collision_risk)
+    selected.policyFallback = bool(status.policy_fallback)
     selected.lineGate = status.line_gate
     selected.edgeGate = status.edge_gate
     selected.entryGate = status.entry_gate
     selected.policyGate = status.policy_gate
-    selected.executionTime = self.execution_time
-    selected.frameDelay = self.frame_delay
-    selected.actionDelay = self.action_delay
+    selected.executionTime = float(self.execution_time)
+    selected.frameDelay = float(self.frame_delay)
+    selected.actionDelay = float(self.action_delay)
     # Called after model/pose serialization, immediately before pm.send. Learn
     # the complete age once, keeping inference and extracted action horizons equal.
-    selected.publishAge = self.timing.observe(model.timestampEof, model_clock_ns(), selected.valid)
+    selected.publishAge = float(self.timing.observe(model.timestampEof, model_clock_ns(), selected.valid))
 
   def fill_invalid_model(self, message, action, status, frame_id, timestamp_eof):
     """Publish explicit rejection when malformed geometry cannot be serialized."""

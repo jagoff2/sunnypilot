@@ -592,6 +592,83 @@ class TestLaneCenteringIntegration(unittest.TestCase):
     adapter.fill_status(model, status)
     self.assertFalse(model.laneCentering.valid)
 
+  def test_status_serialization_accepts_numpy_scalars_without_changing_diagnostics(self):
+    # This exact value/type crashed modeld on a retained road corridor. Other
+    # scalar fields share the same native serialization boundary, including
+    # intentional nonfinite values representing unavailable diagnostics.
+    fields = {'authority': 'authority', 'path_weight': 'pathWeight', 'min_clearance': 'minClearance',
+              'response_time': 'responseTime', 'checked_distance': 'checkedDistance'}
+    for scalar in (np.float32, np.float64):
+      for field, wire_field in fields.items():
+        for value in (32.61423426478729, np.nan, np.inf, -np.inf):
+          with self.subTest(scalar=scalar.__name__, field=field, value=value):
+            adapter = LaneCenteringModelAdapter()
+            adapter.frame_valid = np.bool_(True)
+            adapter.last_timestamp_eof = 1_000_000_000
+            adapter.execution_time = scalar(0.025)
+            adapter.timing.frame_delay = scalar(0.05)
+            adapter.timing.publication_interval = scalar(0.05)
+            status = replace(adapter.controller._status(), **{field: scalar(value)})
+            model = log.ModelDataV2.new_message(frameId=9, timestampEof=adapter.last_timestamp_eof)
+            with patch.object(adapter.timing, 'observe', return_value=scalar(0.08)):
+              adapter.fill_status(model, status)
+            with log.ModelDataV2.from_bytes(model.to_bytes()) as restored:
+              selected = restored.laneCentering
+              actual, expected = getattr(selected, wire_field), float(np.float32(value))
+              if np.isnan(expected):
+                self.assertTrue(np.isnan(actual))
+              else:
+                self.assertEqual(actual, expected)
+              self.assertTrue(selected.valid)
+              self.assertEqual(selected.frameId, 9)
+              self.assertEqual(selected.timestampEof, adapter.last_timestamp_eof)
+              for timing_field, timing_value in (('executionTime', 0.025), ('frameDelay', 0.05),
+                                                 ('actionDelay', 0.025), ('publishAge', 0.08)):
+                self.assertEqual(getattr(selected, timing_field), float(np.float32(timing_value)))
+
+    for value in (False, True):
+      with self.subTest(boolean=value):
+        adapter = LaneCenteringModelAdapter()
+        status = replace(adapter.controller._status(), safety_blocked=np.bool_(value),
+                         collision_risk=np.bool_(value), policy_fallback=np.bool_(value))
+        model = log.ModelDataV2.new_message()
+        adapter.fill_status(model, status)
+        with log.ModelDataV2.from_bytes(model.to_bytes()) as restored:
+          self.assertIs(restored.laneCentering.safetyBlocked, value)
+          self.assertIs(restored.laneCentering.collisionRisk, value)
+          self.assertIs(restored.laneCentering.policyFallback, value)
+
+  def test_real_lane_activation_and_retained_corridor_serialize_every_publication(self):
+    for name, native in native_actions():
+      with self.subTest(model=name):
+        adapter, inputs, output = LaneCenteringModelAdapter(), Inputs(), model_output()
+        # Finite confidence support ends before the native plan. A subsequent
+        # confidence dropout exercises ego-motion propagation of that horizon,
+        # which originally leaked numpy.float64 into status.checked_distance.
+        output['lane_lines_stds'][:, :, 15:, :] = 0.8
+        phases = set()
+        frame_count = round((ENTRY_TIME + RAMP_IN_TIME) / DT_MDL) + 4
+        for frame in range(frame_count + 1):
+          if frame == frame_count:
+            output['lane_lines_prob'][:] = 0.0
+          selected, action, status = self.run_frames(adapter, output, native, inputs)
+          phases.add(status.state)
+          model = log.ModelDataV2.new_message(frameId=frame, timestampEof=adapter.last_timestamp_eof)
+          model.action = action
+          adapter.fill_status(model, status)
+          with log.ModelDataV2.from_bytes(model.to_bytes()) as restored:
+            self.assertTrue(restored.laneCentering.valid)
+            self.assertEqual(restored.laneCentering.state, status.state)
+            self.assertEqual(restored.laneCentering.containment, status.containment)
+            self.assertEqual(restored.laneCentering.checkedDistance, float(np.float32(status.checked_distance)))
+            self.assertEqual(restored.action.desiredCurvature, action.desiredCurvature)
+        self.assertEqual(phases, {'acquiring', 'active'})
+        self.assertEqual(status.state, 'active')
+        self.assertEqual(status.containment, 'contained')
+        self.assertGreater(adapter.controller.corridor_age, 0.0)
+        self.assertIsInstance(adapter.controller.corridor.horizon, np.floating)
+        self.assertLess(status.checked_distance, selected['plan'][0, -1, Plan.POSITION.start])
+
   def test_rejected_lane_proposal_uses_native_plan_and_base_action_history(self):
     for name, native in native_actions():
       with self.subTest(model=name):
