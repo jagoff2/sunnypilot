@@ -227,7 +227,8 @@ class DynamicExperimentalController:
     self._has_mpc_fcw = fcw_filtered_value > 0.5
 
     # Slow down detection
-    self._calculate_slow_down(md)
+    if sm.updated['modelV2']:
+      self._calculate_slow_down(md)
 
     # Slowness detection
     if not (self._standstill_count > 5) and not self._has_slow_down:

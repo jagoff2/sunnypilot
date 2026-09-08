@@ -422,7 +422,7 @@ class SelfdriveD(CruiseHelper):
       self.not_running_prev = not_running
     unavailable_processes = not_running - self.ignored_processes
     if model_command_usable:
-      unavailable_processes.discard('modeld')
+      unavailable_processes.difference_update(('modeld', 'modeld_tinygrad'))
     if self.sm.recv_frame['managerState'] and unavailable_processes:
       self.events.add(EventName.processNotRunning)
     else:

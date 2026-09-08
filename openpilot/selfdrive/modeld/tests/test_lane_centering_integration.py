@@ -6,7 +6,7 @@ import unittest
 from dataclasses import asdict, replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -686,6 +686,171 @@ class TestLaneCenteringIntegration(unittest.TestCase):
         self.assertEqual(action.desiredCurvature, adapter.previous_base_action.desiredCurvature)
         self.assertIs(action, adapter.previous_selected_action)
         self.assertEqual(actual_status.curvature_correction, 0.0)
+
+  def test_optional_planner_exception_publishes_native_command_and_reacquires(self):
+    for name, native in native_actions():
+      with self.subTest(model=name):
+        output = model_output()
+        adapter, inputs, _, _ = self.activate(output, native)
+        failed_controller = adapter.controller
+        adapter.previous_base_action = log.ModelDataV2.Action(desiredCurvature=-0.003, desiredAcceleration=0.2)
+        adapter.previous_selected_action = log.ModelDataV2.Action(desiredCurvature=0.009, desiredAcceleration=0.2)
+        # Fail inside the real active controller, after state/geometry updates,
+        # rather than replacing its entire result with a manufactured fallback.
+        with patch.object(failed_controller, '_build_lane_plan', side_effect=RuntimeError('optional geometry failure')):
+          selected, action, status = self.run_frames(adapter, output, native, inputs)
+        self.assertIs(selected, output)
+        self.assertTrue(adapter.frame_valid)
+        self.assertTrue(adapter.plan_valid)
+        self.assertFalse(adapter.auxiliary_valid)
+        self.assertEqual(adapter.last_optional_error, 'RuntimeError')
+        self.assertEqual(status.reason, 'planner_exception')
+        self.assertTrue(status.policy_fallback)
+        self.assertFalse(status.collision_risk)
+        self.assertFalse(status.safety_blocked)
+        self.assertEqual(status.path_weight, 0.0)
+        self.assertAlmostEqual(action.desiredCurvature, smooth_value(0.0, -0.003, ACTION_SMOOTH_SECONDS), places=8)
+        self.assertEqual(action.desiredCurvature, adapter.previous_base_action.desiredCurvature)
+        self.assertIs(adapter.previous_selected_action, action)
+        self.assertIsNot(adapter.controller, failed_controller)
+        self.assertIsNone(adapter.controller.filtered_center_y)
+        self.assertEqual(adapter.controller.authority, 0.0)
+        model = log.ModelDataV2.new_message(frameId=4, timestampEof=adapter.last_timestamp_eof)
+        model.action = action
+        adapter.fill_status(model, status)
+        self.assertFalse(model.laneCentering.valid)
+        self.assertFalse(model.laneCentering.collisionRisk)
+        self.assertFalse(LaneCenteringSafetyLatch().update(model, True, True, model.timestampEof + 100_000_000, True))
+
+        _, action, status = self.run_frames(adapter, output, native, inputs)
+        self.assertTrue(adapter.auxiliary_valid)
+        self.assertEqual(action.desiredCurvature, adapter.previous_base_action.desiredCurvature)
+        _, _, status = self.run_frames(adapter, output, native, inputs, frames=40)
+        self.assertEqual(status.state, 'active')
+        self.assertEqual(status.authority, 1.0)
+
+  def test_optional_failure_cannot_validate_invalid_native_command_or_timestamp(self):
+    native = native_actions()[0][1]
+    for fault in ('plan', 'action', 'duplicate_timestamp'):
+      with self.subTest(fault=fault):
+        adapter, inputs, output = LaneCenteringModelAdapter(), Inputs(), model_output()
+        self.run_frames(adapter, output, native, inputs)
+        previous_base = adapter.previous_base_action
+        adapter.previous_selected_action = log.ModelDataV2.Action(desiredCurvature=0.009)
+        if fault == 'plan':
+          output['plan'][0, 3, 1] = np.nan
+        elif fault == 'action':
+          output['action'] = np.array([[0.0, np.nan]], dtype=np.float32)
+        with patch.object(adapter.controller, 'update', side_effect=RuntimeError('optional failure')):
+          _, action, status = self.run_frames(adapter, output, native, inputs, gap=0.0 if fault == 'duplicate_timestamp' else DT_MDL)
+        self.assertFalse(adapter.frame_valid)
+        self.assertIs(adapter.previous_base_action, previous_base)
+        self.assertIs(action, previous_base)
+        self.assertIs(adapter.previous_selected_action, previous_base)
+        self.assertFalse(status.collision_risk)
+        self.assertFalse(adapter.auxiliary_valid)
+
+  def test_malformed_optional_plan_falls_back_without_invalidating_valid_native(self):
+    adapter, inputs, output = LaneCenteringModelAdapter(), Inputs(), model_output()
+    malformed = {**output, 'plan': np.zeros((1, 2, 3), dtype=np.float32)}
+    with patch.object(adapter.controller, 'update', return_value=(malformed, adapter.controller._status())):
+      selected, action, status = self.run_frames(adapter, output, native_actions()[0][1], inputs)
+    self.assertIs(selected, output)
+    self.assertTrue(adapter.plan_valid)
+    self.assertTrue(adapter.frame_valid)
+    self.assertEqual(action.desiredCurvature, adapter.previous_base_action.desiredCurvature)
+    self.assertEqual(status.reason, 'planner_exception')
+
+  def test_telemetry_transport_exception_cannot_interrupt_selected_command(self):
+    native, output = native_actions()[0][1], model_output()
+    adapter, inputs, _, _ = self.activate(output, native)
+    # Use the real telemetry call and fail only its transport. The handler must
+    # not recursively attempt to log the logger failure.
+    adapter.telemetry.last_emit_time = None
+    with patch('openpilot.selfdrive.modeld.lane_centering_integration.cloudlog.event', side_effect=RuntimeError('transport')) as event:
+      selected, action, status = self.run_frames(adapter, output, native, inputs)
+    self.assertEqual(event.call_count, 1)
+    self.assertEqual(adapter.telemetry_failures, 1)
+    self.assertTrue(adapter.frame_valid)
+    self.assertTrue(adapter.auxiliary_valid)
+    self.assertEqual(status.path_weight, 1.0)
+    self.assertIsNot(selected['plan'], output['plan'])
+    self.assertEqual(action.desiredCurvature, adapter.previous_selected_action.desiredCurvature)
+
+  def test_status_failure_is_transactional_and_keeps_driving_command(self):
+    native, output = native_actions()[0][1], model_output()
+    adapter, inputs, selected, action = self.activate(output, native)
+    status = adapter.controller._status()
+    model = log.ModelDataV2.new_message(frameId=9, timestampEof=adapter.last_timestamp_eof)
+    model.action = action
+    model.position.x = selected['plan'][0, :, Plan.POSITION.start].tolist()
+    model.position.y = selected['plan'][0, :, Plan.POSITION.start + 1].tolist()
+    original_action, original_x, original_y = model.action.to_dict(), list(model.position.x), list(model.position.y)
+    model.laneCentering.valid = True
+    model.laneCentering.collisionRisk = True
+    # A late conversion error occurs after several staged fields are populated.
+    broken = replace(status, checked_distance=object())
+    adapter.fill_status(model, broken)
+    with log.ModelDataV2.from_bytes(model.to_bytes()) as restored:
+      self.assertEqual(restored.action.to_dict(), original_action)
+      self.assertEqual(list(restored.position.x), original_x)
+      self.assertEqual(list(restored.position.y), original_y)
+      self.assertFalse(restored.laneCentering.valid)
+      self.assertFalse(restored.laneCentering.collisionRisk)
+      self.assertFalse(restored.laneCentering.safetyBlocked)
+      self.assertEqual(restored.laneCentering.reason, 'status_serialization_error')
+    self.assertEqual(adapter.status_failures, 1)
+    self.assertTrue(adapter.frame_valid)
+    self.assertFalse(LaneCenteringSafetyLatch().update(model, True, True, model.timestampEof + 100_000_000, True))
+    adapter.fill_status(model, status)
+    self.assertTrue(model.laneCentering.valid)
+
+  def test_plan_sequences_have_one_array_contract_without_mutating_native_arrays(self):
+    for name, native in native_actions():
+      with self.subTest(model=name):
+        adapter, inputs, original = LaneCenteringModelAdapter(), Inputs(), model_output()
+        sequence = original['plan'].tolist()
+        output = {**original, 'plan': sequence}
+        selected, action, _ = self.run_frames(adapter, output, native, inputs)
+        self.assertTrue(adapter.frame_valid)
+        self.assertIsInstance(selected['plan'], np.ndarray)
+        self.assertIs(output['plan'], sequence)
+        np.testing.assert_array_equal(selected['plan'], original['plan'])
+        for key in original.keys() - {'plan'}:
+          self.assertIs(selected[key], original[key])
+        self.assertTrue(np.isfinite(action.desiredCurvature))
+        # The same normalization must hold on a direct warm core call too.
+        self.run_frames(adapter, original, native, inputs, frames=40)
+        selected, _ = adapter.controller.update(output, 20.0, 0.0, 0.475, DT_MDL,
+                                               adapter.previous_base_action.desiredCurvature,
+                                               adapter.previous_selected_action.desiredCurvature,
+                                               True, True, False, False, False)
+        self.assertTrue(adapter.frame_valid)
+        self.assertIsInstance(selected['plan'], np.ndarray)
+        self.assertIs(output['plan'], sequence)
+        untouched = LaneCenteringModelAdapter('off')
+        selected, _, _ = self.run_frames(untouched, original, native, inputs)
+        self.assertIs(selected, original)
+        self.assertIs(selected['plan'], original['plan'])
+
+  def test_invalid_plan_sequence_is_rejected_before_native_action_or_writer(self):
+    for value in (np.nan, 'invalid', 10**400):
+      with self.subTest(value_type=type(value).__name__):
+        adapter, inputs, output = LaneCenteringModelAdapter(), Inputs(), model_output()
+        output['plan'] = output['plan'].tolist()
+        output['plan'][0][3][1] = value
+        native = Mock(side_effect=AssertionError('invalid plan reached native action'))
+        with patch.object(adapter, '_optional_failure', wraps=adapter._optional_failure) as optional_failure:
+          _, action, status = self.run_frames(adapter, output, native, inputs)
+        native.assert_not_called()
+        optional_failure.assert_not_called()
+        self.assertFalse(adapter.plan_valid)
+        self.assertFalse(adapter.frame_valid)
+        message = log.Event.new_message()
+        message.init('modelV2')
+        adapter.fill_invalid_model(message, action, status, 1, adapter.last_timestamp_eof)
+        self.assertFalse(message.valid)
+        self.assertFalse(message.modelV2.laneCentering.valid)
 
   def test_invalid_plans_and_actions_preserve_finite_history_and_recover(self):
     for name, native in native_actions():

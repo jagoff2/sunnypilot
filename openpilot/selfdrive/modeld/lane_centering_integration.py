@@ -14,7 +14,8 @@ from openpilot.selfdrive.controls.lib.drive_helpers import get_curvature_from_pl
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
 from openpilot.selfdrive.modeld.lane_centering_safety import LANE_CENTERING_STATUS_VERSION, MAX_MODEL_AGE_NS, model_clock_ns
 from openpilot.selfdrive.modeld.lane_centering import (
-  ACTION_SMOOTH_SECONDS, CAMERA_OFFSET, EGO_HALF_WIDTH, LaneCenteringController, get_lane_centering_input_status,
+  ACTION_SMOOTH_SECONDS, CAMERA_OFFSET, EGO_HALF_WIDTH, LaneCenteringController, LaneCenteringStatus,
+  get_lane_centering_input_status, normalize_model_plan,
 )
 
 
@@ -185,6 +186,7 @@ def update_lane_change_helpers(model_output, car_state, lat_active, v_ego, desir
 
 class LaneCenteringModelAdapter:
   def __init__(self, mode="absolute"):
+    self.mode = mode
     self.controller = LaneCenteringController(mode)
     self.previous_base_action = log.ModelDataV2.Action()
     self.previous_selected_action = log.ModelDataV2.Action()
@@ -195,6 +197,25 @@ class LaneCenteringModelAdapter:
     self.timing = ModelPublicationTiming()
     self.execution_time = 0.0
     self.planner_execution_time = 0.0
+    self.auxiliary_valid = True
+    self.last_optional_error = ""
+    self.telemetry_failures = 0
+    self.status_failures = 0
+
+  def _optional_failure(self, error):
+    # Discard all optional authority, retained geometry and selected-filter
+    # state. The independently validated native history remains available.
+    self.controller = LaneCenteringController(self.mode)
+    self.previous_selected_action = self.previous_base_action
+    self.auxiliary_valid = False
+    self.last_optional_error = type(error).__name__
+    return LaneCenteringStatus(
+      state='inactive', source='none', reason='planner_exception', authority=0.0,
+      lane_width=math.nan, center_offset=math.nan, policy_disagreement=math.nan,
+      curvature_correction=0.0, lane_path_feasibility=0.0, path_weight=0.0,
+      requested_lateral_jerk=0.0, line_gate='planner_exception', edge_gate='planner_exception',
+      entry_gate='planner_exception', policy_gate='planner_exception', policy_fallback=True,
+    )
 
   @property
   def frame_delay(self):
@@ -207,6 +228,9 @@ class LaneCenteringModelAdapter:
   def update(self, model_output, action_from_model, sm, calibration_seen, lane_change_state,
              timestamp_eof, v_ego, lat_action_t, long_action_t):
     execution_start = time.perf_counter()
+    model_output = normalize_model_plan(model_output)
+    self.auxiliary_valid = True
+    self.last_optional_error = ""
     frame_dt = DT_MDL if self.last_timestamp_eof is None else (timestamp_eof - self.last_timestamp_eof) * 1e-9
     self.frame_valid = bool(timestamp_eof > 0 and 0.0 < frame_dt <= MAX_MODEL_AGE_NS * 1e-9)
     smoothing_dt = frame_dt if self.frame_valid else DT_MDL
@@ -235,23 +259,32 @@ class LaneCenteringModelAdapter:
     # Both entrypoints include the captured 0.1 s smoothing compensation in
     # inference inputs and this lookahead, in addition to C4 frame/action delay.
     planner_start = time.perf_counter()
-    selected_output, status = self.controller.update(
-      model_output, v_ego, sm['carControl'].currentCurvature, lat_action_t, frame_dt,
-      base_action.desiredCurvature, self.previous_selected_action.desiredCurvature,
-      sm['carControl'].latActive, inputs.ready and action_valid, sm['carState'].leftBlinker, sm['carState'].rightBlinker,
-      lane_change_state != log.LaneChangeState.off,
-    )
-    self.planner_execution_time = time.perf_counter() - planner_start
-
     # Match the action to the same trajectory published for NNLC preview. Keep
     # one selected filter history through acquisition, release and base-plan fallback.
-    self.plan_valid = self.plan_valid and _valid_plan(selected_output)
     curvature = math.nan
-    if action_valid and self.plan_valid:
-      # A rejected lane proposal cannot continue steering through its retained
-      # selected-filter history. The core returns the original policy plan.
-      curvature = base_action.desiredCurvature if status.policy_fallback else _get_lateral_curvature(
-        selected_output, self.previous_selected_action.desiredCurvature, v_ego, lat_action_t, smoothing_dt)
+    try:
+      selected_output, status = self.controller.update(
+        model_output, v_ego, sm['carControl'].currentCurvature, lat_action_t, frame_dt,
+        base_action.desiredCurvature, self.previous_selected_action.desiredCurvature,
+        sm['carControl'].latActive, inputs.ready and action_valid, sm['carState'].leftBlinker, sm['carState'].rightBlinker,
+        lane_change_state != log.LaneChangeState.off,
+      )
+      if not isinstance(status, LaneCenteringStatus) or (self.plan_valid and not _valid_plan(selected_output)):
+        raise ValueError('invalid_optional_output')
+      if action_valid and self.plan_valid:
+        # A rejected lane proposal cannot continue steering through its retained
+        # selected-filter history. The core returns the original policy plan.
+        curvature = base_action.desiredCurvature if status.policy_fallback else _get_lateral_curvature(
+          selected_output, self.previous_selected_action.desiredCurvature, v_ego, lat_action_t, smoothing_dt)
+        if not math.isfinite(curvature):
+          raise ValueError('invalid_optional_curvature')
+    except Exception as error:
+      # Only optional lane computation is isolated. Native plan/action/timestamp
+      # validation above still decides whether any command can be published.
+      status = self._optional_failure(error)
+      selected_output = model_output
+      curvature = base_action.desiredCurvature if action_valid else math.nan
+    self.planner_execution_time = time.perf_counter() - planner_start
     action_valid = action_valid and math.isfinite(curvature)
     self.frame_valid = self.frame_valid and action_valid
     if self.frame_valid:
@@ -274,22 +307,44 @@ class LaneCenteringModelAdapter:
     if self.frame_valid:
       self.previous_base_action = base_action
       self.previous_selected_action = action
-    self.telemetry.update(self.controller.mode, status, inputs, model_output, selected_output, timestamp_eof, frame_dt, v_ego,
-                          base_action.desiredCurvature, action.desiredCurvature, timing={
-                            'planner_execution_s': _finite_number(self.planner_execution_time),
-                            'adapter_execution_before_telemetry_s': _finite_number(time.perf_counter() - execution_start),
-                            'adapter_output_age_s': _finite_number((model_clock_ns() - timestamp_eof) * 1e-9),
-                            'frame_delay_s': _finite_number(self.frame_delay),
-                            'lateral_action_delay_s': _finite_number(self.action_delay),
-                          })
+    try:
+      self.telemetry.update(self.controller.mode, status, inputs, model_output, selected_output, timestamp_eof, frame_dt, v_ego,
+                            base_action.desiredCurvature, action.desiredCurvature, timing={
+                              'planner_execution_s': _finite_number(self.planner_execution_time),
+                              'adapter_execution_before_telemetry_s': _finite_number(time.perf_counter() - execution_start),
+                              'adapter_output_age_s': _finite_number((model_clock_ns() - timestamp_eof) * 1e-9),
+                              'frame_delay_s': _finite_number(self.frame_delay),
+                              'lateral_action_delay_s': _finite_number(self.action_delay),
+                            })
+    except Exception:
+      # Reporting must not stop inference or recursively use a broken logger.
+      self.telemetry_failures += 1
     self.execution_time = time.perf_counter() - execution_start
     return selected_output, action, status
 
   def fill_status(self, model, status):
     """Attach the decision only after fill_model_msg set the matching frame."""
-    selected = model.laneCentering
+    # Stage optional metadata separately. A conversion/serialization failure
+    # cannot leave a partially valid status attached to the driving command.
+    staged = log.ModelDataV2.new_message()
+    try:
+      self._fill_status(staged.laneCentering, model, status)
+      model.laneCentering = staged.laneCentering
+    except Exception:
+      self.status_failures += 1
+      staged = log.ModelDataV2.new_message()
+      staged.laneCentering.version = LANE_CENTERING_STATUS_VERSION
+      staged.laneCentering.frameId = model.frameId
+      staged.laneCentering.timestampEof = model.timestampEof
+      staged.laneCentering.reason = 'status_serialization_error'
+      staged.laneCentering.valid = False
+      model.laneCentering = staged.laneCentering
+
+  def _fill_status(self, selected, model, status):
     selected.version = LANE_CENTERING_STATUS_VERSION
-    selected.valid = bool(self.frame_valid and model.timestampEof == self.last_timestamp_eof and math.isfinite(model.action.desiredCurvature))
+    command_valid = bool(self.frame_valid and model.timestampEof == self.last_timestamp_eof and
+                         math.isfinite(model.action.desiredCurvature))
+    selected.valid = command_valid and self.auxiliary_valid
     selected.frameId = model.frameId
     selected.timestampEof = model.timestampEof
     selected.state = status.state
@@ -315,7 +370,7 @@ class LaneCenteringModelAdapter:
     selected.actionDelay = float(self.action_delay)
     # Called after model/pose serialization, immediately before pm.send. Learn
     # the complete age once, keeping inference and extracted action horizons equal.
-    selected.publishAge = float(self.timing.observe(model.timestampEof, model_clock_ns(), selected.valid))
+    selected.publishAge = float(self.timing.observe(model.timestampEof, model_clock_ns(), command_valid))
 
   def fill_invalid_model(self, message, action, status, frame_id, timestamp_eof):
     """Publish explicit rejection when malformed geometry cannot be serialized."""

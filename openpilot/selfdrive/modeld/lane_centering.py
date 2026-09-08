@@ -97,6 +97,20 @@ MODEL_X = np.asarray(ModelConstants.X_IDXS, dtype=np.float64)
 LANE_CENTERING_INPUT_SERVICES = ("carState", "carControl")
 
 
+def normalize_model_plan(model_output):
+  """Give sequence plans the same array contract as native inference output."""
+  plan = model_output.get("plan")
+  if not isinstance(plan, (list, tuple)):
+    return model_output
+  try:
+    plan = np.asarray(plan, dtype=np.float64)
+  except (TypeError, ValueError, OverflowError):
+    plan = np.empty(0)
+  # Preserve every actual ndarray and its dtype/identity. Only the sequence
+  # representation needs a replacement dict, shared by action and publication.
+  return {**model_output, "plan": plan}
+
+
 @dataclass(frozen=True)
 class LaneCenteringStatus:
   state: str
@@ -1615,6 +1629,7 @@ class LaneCenteringController:
              previous_selected_curvature: float,
              lat_active: bool, model_valid: bool, left_blinker: bool, right_blinker: bool,
              lane_change_active: bool) -> tuple[dict[str, np.ndarray], LaneCenteringStatus]:
+    model_output = normalize_model_plan(model_output)
     self.line_gate = "not_evaluated"
     self.edge_gate = "not_evaluated"
     self.entry_gate = "not_evaluated"

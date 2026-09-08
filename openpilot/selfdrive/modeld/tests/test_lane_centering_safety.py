@@ -511,8 +511,10 @@ class TestLaneCenteringSafety(unittest.TestCase):
       def all_checks(self, services):
         return self.all_alive(services) and self.all_freq_ok(services)
 
+    stopped_process_cases = tuple((backend, *others) for backend in ('modeld', 'modeld_tinygrad')
+                                  for others in ((), ('controlsd',), ('mapd',)))
     for mads_only in (False, True):
-      for stopped in (('modeld',), ('modeld', 'controlsd'), ('modeld', 'mapd')):
+      for stopped in (*stopped_process_cases, ('modeld', 'modeld_tinygrad')):
         for camera_fault in (None, 'alive', 'frequency'):
           with self.subTest(mads_only=mads_only, stopped=stopped, camera_fault=camera_fault):
             clock, logs = [1_150_000_000], []
@@ -539,6 +541,11 @@ class TestLaneCenteringSafety(unittest.TestCase):
             self.assertEqual(selfdrive.ignored_processes, {'mapd'})
 
             inputs.updated['modelV2'] = False
+            clock[0] = inputs['modelV2'].timestampEof + MAX_MODEL_AGE_NS
+            events.clear()
+            namespace['process_events'](selfdrive)
+            self.assertEqual(events, expected)
+
             clock[0] = inputs['modelV2'].timestampEof + MAX_MODEL_AGE_NS + 1
             events.clear()
             namespace['process_events'](selfdrive)
