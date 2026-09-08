@@ -196,13 +196,11 @@ class SelfdriveD(CruiseHelper):
       self.events.add(EventName.bigModelLoading)
     if alerts.failed:
       self.events.add(EventName.bigModelFailed)
-    if alerts.ready:
-      self.events_sp.add(custom.OnroadEventSP.EventName.bigModelReady)
 
   def update_lane_centering_events(self):
     maneuver_active = self.sm.seen['lateralManeuverPlan'] and self.sm.all_checks(['lateralManeuverPlan'])
     if maneuver_active or self.sm['controlsState'].lateralControlState.which() == 'debugState':
-      return
+      return False
     engagement_requested = self.mads.enabled if self.mads.enabled_toggle else self.enabled
     blocked = self.lane_centering_safety.update(
       self.sm['modelV2'], self.sm.seen['modelV2'] and self.sm.all_alive(['modelV2']) and self.sm.all_valid(['modelV2']),
@@ -214,6 +212,7 @@ class SelfdriveD(CruiseHelper):
       self.events.add(EventName.laneCenteringUnavailable)
     elif self.lane_centering_safety.collision_risk:
       self.events.add(EventName.laneCenteringCollisionRisk)
+    return not blocked and self.lane_centering_safety.selected_model is not None
 
   def update_events(self, CS):
     """Compute onroadEvents from carState"""
@@ -252,7 +251,13 @@ class SelfdriveD(CruiseHelper):
     if self.CP.passive:
       return
 
-    self.update_lane_centering_events()
+    model_command_usable = self.update_lane_centering_events()
+    model_v2 = self.lane_centering_safety.selected_model if model_command_usable else self.sm['modelV2']
+    if model_command_usable:
+      # Background model loading/failure flags cannot override a usable command.
+      # Keep the availability tracker running, including during initialization.
+      self.events.remove(EventName.bigModelLoading)
+      self.events.remove(EventName.bigModelFailed)
 
     # Block resume if cruise never previously enabled
     resume_pressed = any(be.type in (ButtonType.accelCruise, ButtonType.resumeCruise) for be in CS.buttonEvents)
@@ -415,7 +420,10 @@ class SelfdriveD(CruiseHelper):
       if not_running != self.not_running_prev:
         cloudlog.event("process_not_running", not_running=not_running, error=True)
       self.not_running_prev = not_running
-    if self.sm.recv_frame['managerState'] and (not_running - self.ignored_processes):
+    unavailable_processes = not_running - self.ignored_processes
+    if model_command_usable:
+      unavailable_processes.discard('modeld')
+    if self.sm.recv_frame['managerState'] and unavailable_processes:
       self.events.add(EventName.processNotRunning)
     else:
       if not SIMULATION and not self.rk.lagging:
@@ -440,11 +448,14 @@ class SelfdriveD(CruiseHelper):
     # generic catch-all. ideally, a more specific event should be added above instead
     has_disable_events = self.events.contains(ET.NO_ENTRY) and (self.events.contains(ET.SOFT_DISABLE) or self.events.contains(ET.IMMEDIATE_DISABLE))
     no_system_errors = (not has_disable_events) or (len(self.events) == num_events)
-    # Background GPU recovery must not suppress ordinary model/comm checks.
-    if not self.sm.all_checks() and no_system_errors:
-      if not self.sm.all_alive():
+    # The shared command guard already bounds model recovery by camera age.
+    # Do not let a rejected packet or frequency average bypass that decision;
+    # every other service retains its ordinary validity/alive/frequency checks.
+    health_services = [s for s in self.sm.services if not (model_command_usable and s == 'modelV2')]
+    if not self.sm.all_checks(health_services) and no_system_errors:
+      if not self.sm.all_alive(health_services):
         self.events.add(EventName.commIssue)
-      elif not self.sm.all_freq_ok():
+      elif not self.sm.all_freq_ok(health_services):
         self.events.add(EventName.commIssueAvgFreq)
       else:
         self.events.add(EventName.commIssue)
@@ -489,7 +500,7 @@ class SelfdriveD(CruiseHelper):
     if lac.active and not recent_steer_pressed and not self.CP.notCar:
       clipped_speed = max(CS.vEgo, 0.3)
       actual_lateral_accel = controlstate.curvature * (clipped_speed**2)
-      desired_lateral_accel = self.sm['modelV2'].action.desiredCurvature * (clipped_speed**2)
+      desired_lateral_accel = model_v2.action.desiredCurvature * (clipped_speed**2)
       undershooting = abs(desired_lateral_accel) / abs(1e-3 + actual_lateral_accel) > 1.2
       turning = abs(desired_lateral_accel) > 1.0
       # TODO: lac.saturated includes speed and other checks, should be pulled out
@@ -498,7 +509,7 @@ class SelfdriveD(CruiseHelper):
 
     # Check for FCW
     stock_long_is_braking = self.enabled and not self.CP.openpilotLongitudinalControl and CS.aEgo < -1.25
-    model_fcw = self.sm['modelV2'].meta.hardBrakePredicted and not CS.brakePressed and not stock_long_is_braking
+    model_fcw = model_v2.meta.hardBrakePredicted and not CS.brakePressed and not stock_long_is_braking
     planner_fcw = self.sm['longitudinalPlan'].fcw and self.enabled
     if (planner_fcw or model_fcw) and not self.CP.notCar:
       self.events.add(EventName.fcw)
@@ -512,7 +523,7 @@ class SelfdriveD(CruiseHelper):
     self.distance_traveled += abs(CS.vEgo) * DT_CTRL
 
     # TODO: fix simulator
-    if not SIMULATION or REPLAY:
+    if (not SIMULATION or REPLAY) and not model_command_usable:
       if self.sm['modelV2'].frameDropPerc > 1:
         self.events.add(EventName.modeldLagging)
 

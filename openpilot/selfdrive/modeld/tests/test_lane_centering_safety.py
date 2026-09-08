@@ -377,6 +377,216 @@ class TestLaneCenteringSafety(unittest.TestCase):
       self.assertEqual(mads.update(), (True, True))
       self.assertIn(et.WARNING, stock.current_alert_types)
 
+  def test_generic_model_health_checks_defer_to_usable_command_but_keep_other_service_faults(self):
+    tree = ast.parse((ROOT / 'openpilot/selfdrive/selfdrived/selfdrived.py').read_text())
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'SelfdriveD')
+    guard_method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == 'update_lane_centering_events')
+    update = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == 'update_events')
+    # Execute the actual guard, auxiliary-event removal, generic checks and
+    # frame-drop branch in their production order, without unrelated native IPC.
+    relevant_names = ('model_command_usable', 'model_v2', 'num_events', 'has_disable_events', 'no_system_errors', 'health_services')
+    selected = [node for node in update.body if
+                (isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id in relevant_names for target in node.targets)) or
+                (isinstance(node, ast.If) and (('model_command_usable' in ast.unparse(node.test) and
+                                               'unavailable_processes' not in ast.unparse(node)) or
+                                              'self.sm.all_checks(health_services)' in ast.unparse(node.test)))]
+    update_subset = ast.FunctionDef(name='model_health_events', args=guard_method.args, body=selected, decorator_list=[])
+    et = SimpleNamespace(NO_ENTRY='noEntry', SOFT_DISABLE='softDisable', IMMEDIATE_DISABLE='immediateDisable')
+    event_name = log.OnroadEvent.EventName
+
+    class Events(set):
+      def remove(self, event):
+        self.discard(event)
+
+      def contains(self, event_type):
+        disabling = {event_name.bigModelFailed, event_name.commIssue, event_name.commIssueAvgFreq, event_name.modeldLagging,
+                     event_name.laneCenteringUnavailable}
+        if event_type == et.NO_ENTRY:
+          return bool(self & (disabling | {event_name.bigModelLoading}))
+        if event_type == et.IMMEDIATE_DISABLE:
+          return event_name.laneCenteringUnavailable in self
+        return bool(self & (disabling - {event_name.laneCenteringUnavailable}))
+
+    class Inputs(dict):
+      def __init__(self):
+        super().__init__(controlsState=SimpleNamespace(lateralControlState=SimpleNamespace(which=lambda: 'torqueState')))
+        self.services = ['modelV2', 'carState', 'deviceMotion']
+        self.seen = {'modelV2': True, 'lateralManeuverPlan': False}
+        self.updated = {'modelV2': True}
+        self.alive = dict.fromkeys(self.services, True)
+        self.freq_ok = dict.fromkeys(self.services, True)
+        self.valid = dict.fromkeys(self.services, True)
+
+      def all_alive(self, services=None):
+        return all(self.alive[s] for s in services or self.services)
+
+      def all_freq_ok(self, services=None):
+        return all(self.freq_ok[s] for s in services or self.services)
+
+      def all_valid(self, services=None):
+        return all(self.valid[s] for s in services or self.services)
+
+      def all_checks(self, services=None):
+        return self.all_alive(services) and self.all_freq_ok(services) and self.all_valid(services)
+
+    for mads_only in (False, True):
+      for fault in ('valid', 'alive', 'freq_ok', 'frame_drop'):
+        for other_fault in (None, 'valid', 'alive', 'freq_ok'):
+          with self.subTest(mads_only=mads_only, model_fault=fault, other_fault=other_fault):
+            clock = [1_150_000_000]
+            namespace = {'EventName': event_name, 'ET': et, 'SIMULATION': False, 'REPLAY': False,
+                         'model_clock_ns': lambda clock=clock: clock[0], 'cloudlog': SimpleNamespace(event=lambda *args, **kwargs: None)}
+            module = ast.fix_missing_locations(ast.Module(body=[guard_method, update_subset], type_ignores=[]))
+            exec(compile(module, 'selfdrived.py', 'exec'), namespace)
+            inputs, events = Inputs(), Events()
+            selfdrive = SimpleNamespace(sm=inputs, enabled=not mads_only, events=events, logged_comm_issue=None,
+                                        lane_centering_safety=LaneCenteringSafetyLatch(),
+                                        mads=SimpleNamespace(enabled_toggle=mads_only, enabled=True))
+            selfdrive.update_lane_centering_events = lambda selfdrive=selfdrive, namespace=namespace: namespace['update_lane_centering_events'](selfdrive)
+            good = model_frame()
+            inputs['modelV2'] = good
+            namespace['model_health_events'](selfdrive)
+            self.assertFalse(events)
+            bad = model_frame(1_050_000_000, 2)
+            bad.frameDropPerc = 50.0
+            inputs['modelV2'] = bad
+            if fault != 'frame_drop':
+              getattr(inputs, fault)['modelV2'] = False
+            if other_fault is not None:
+              getattr(inputs, other_fault)['deviceMotion'] = False
+            events.update((event_name.bigModelLoading, event_name.bigModelFailed))
+            clock[0] = 1_200_000_000
+            namespace['model_health_events'](selfdrive)
+            expected = set() if other_fault is None else {event_name.commIssueAvgFreq if other_fault == 'freq_ok' else event_name.commIssue}
+            self.assertEqual(events, expected)
+            self.assertIsNone(selfdrive.lane_centering_safety.reason)
+            self.assertIsNone(selfdrive.lane_centering_safety.latched_reason)
+
+            # Once no fresh usable command remains, model-specific exclusions
+            # stop, including the legacy frame-drop event and genuine fatal.
+            clock[0] = 1_500_000_001
+            events.clear()
+            namespace['model_health_events'](selfdrive)
+            self.assertIn(event_name.laneCenteringUnavailable, events)
+            self.assertIn(event_name.modeldLagging, events)
+
+    source = ast.unparse(update)
+    self.assertLess(source.index('self.update_lane_centering_events()'), source.index('self.sm.all_checks(health_services)'))
+    self.assertIn('desired_lateral_accel = model_v2.action.desiredCurvature', source)
+    self.assertIn('model_fcw = model_v2.meta.hardBrakePredicted', source)
+
+  def test_stopped_modeld_defers_only_while_command_usable_and_preserves_other_process_and_camera_faults(self):
+    tree = ast.parse((ROOT / 'openpilot/selfdrive/selfdrived/selfdrived.py').read_text())
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'SelfdriveD')
+    guard_method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == 'update_lane_centering_events')
+    update = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == 'update_events')
+    # Preserve the entire production process-watchdog block, including the
+    # camera-check else branch, and derive its usability from the real guard.
+    start = next(i for i, node in enumerate(update.body) if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == 'not_running')
+    end = next(i for i, node in enumerate(update.body[start:], start) if isinstance(node, ast.If) and
+               'EventName.processNotRunning' in ast.unparse(node))
+    decision = next(node for node in update.body if isinstance(node, ast.Assign) and ast.unparse(node.targets[0]) == 'model_command_usable')
+    process_method = ast.FunctionDef(name='process_events', args=guard_method.args, body=[decision, *update.body[start:end + 1]], decorator_list=[])
+    event_name = log.OnroadEvent.EventName
+
+    class Inputs(dict):
+      def __init__(self, stopped, camera_fault):
+        super().__init__(controlsState=SimpleNamespace(lateralControlState=SimpleNamespace(which=lambda: 'torqueState')),
+                         modelV2=model_frame(), managerState=SimpleNamespace(processes=[
+                           SimpleNamespace(name=name, running=False, shouldBeRunning=True) for name in stopped]))
+        self.seen = {'modelV2': True, 'lateralManeuverPlan': False}
+        self.updated = {'modelV2': True}
+        self.recv_frame = {'managerState': 1}
+        self.camera_fault = camera_fault
+
+      def all_alive(self, services):
+        return not (services == ['roadCameraState'] and self.camera_fault == 'alive')
+
+      def all_freq_ok(self, services):
+        return not (services == ['roadCameraState'] and self.camera_fault == 'frequency')
+
+      def all_valid(self, services):
+        return True
+
+      def all_checks(self, services):
+        return self.all_alive(services) and self.all_freq_ok(services)
+
+    for mads_only in (False, True):
+      for stopped in (('modeld',), ('modeld', 'controlsd'), ('modeld', 'mapd')):
+        for camera_fault in (None, 'alive', 'frequency'):
+          with self.subTest(mads_only=mads_only, stopped=stopped, camera_fault=camera_fault):
+            clock, logs = [1_150_000_000], []
+            namespace = {'EventName': event_name, 'SIMULATION': False, 'model_clock_ns': lambda clock=clock: clock[0],
+                         'cloudlog': SimpleNamespace(event=lambda name, logs=logs, **kwargs: logs.append((name, kwargs)))}
+            module = ast.fix_missing_locations(ast.Module(body=[guard_method, process_method], type_ignores=[]))
+            exec(compile(module, 'selfdrived.py', 'exec'), namespace)
+            inputs, events = Inputs(stopped, camera_fault), set()
+            selfdrive = SimpleNamespace(sm=inputs, enabled=not mads_only, events=events, ignored_processes={'mapd'},
+                                        lane_centering_safety=LaneCenteringSafetyLatch(), not_running_prev=set(),
+                                        mads=SimpleNamespace(enabled_toggle=mads_only, enabled=True),
+                                        rk=SimpleNamespace(lagging=False), camera_packets=['roadCameraState'])
+            selfdrive.update_lane_centering_events = lambda selfdrive=selfdrive, namespace=namespace: namespace['update_lane_centering_events'](selfdrive)
+            namespace['process_events'](selfdrive)
+            if 'controlsd' in stopped:
+              expected = {event_name.processNotRunning}
+            elif camera_fault is not None:
+              expected = {event_name.cameraMalfunction if camera_fault == 'alive' else event_name.cameraFrameRate}
+            else:
+              expected = set()
+            self.assertEqual(events, expected)
+            self.assertEqual(logs[0][1]['not_running'], set(stopped))
+            self.assertEqual(selfdrive.not_running_prev, set(stopped))
+            self.assertEqual(selfdrive.ignored_processes, {'mapd'})
+
+            inputs.updated['modelV2'] = False
+            clock[0] = inputs['modelV2'].timestampEof + MAX_MODEL_AGE_NS + 1
+            events.clear()
+            namespace['process_events'](selfdrive)
+            self.assertIn(event_name.laneCenteringUnavailable, events)
+            self.assertIn(event_name.processNotRunning, events)
+
+            # A real disengagement clears the fatal latch. Fresh model output
+            # can recover even before the manager's process snapshot catches up.
+            selfdrive.enabled = selfdrive.mads.enabled = False
+            inputs['modelV2'] = model_frame(1_400_000_000, 2)
+            inputs.updated['modelV2'] = True
+            clock[0] = 1_450_000_000
+            events.clear()
+            namespace['process_events'](selfdrive)
+            self.assertEqual(events, expected)
+            self.assertIsNone(selfdrive.lane_centering_safety.reason)
+
+  def test_model_ready_tracker_runs_without_emitting_noncollision_advisory(self):
+    from openpilot.system.hardware.chestnut.availability import ModelAvailability
+
+    tree = ast.parse((ROOT / 'openpilot/selfdrive/selfdrived/selfdrived.py').read_text())
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'SelfdriveD')
+    method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == 'update_chestnut_events')
+    clock = [0.0]
+    namespace = {'EventName': log.OnroadEvent.EventName, 'custom': custom, 'time': SimpleNamespace(monotonic=lambda: clock[0])}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), 'selfdrived.py', 'exec'), namespace)
+
+    class Inputs(dict):
+      seen = {'modelV2': True}
+      healthy = True
+
+      def all_checks(self, services):
+        return self.healthy
+
+    inputs = Inputs(modelV2=log.ModelDataV2.new_message(big=True))
+    selfdrive = SimpleNamespace(sm=inputs, events=set(), events_sp=set(), model_availability=ModelAvailability(),
+                                params=SimpleNamespace(get_bool=lambda name: False))
+    for now in (0.0, 1.0, 2.0, 3.0):
+      clock[0] = now
+      namespace['update_chestnut_events'](selfdrive)
+    self.assertTrue(selfdrive.model_availability.ready_announced)
+    self.assertTrue(selfdrive.model_availability.was_big)
+    self.assertFalse(selfdrive.events)
+    self.assertFalse(selfdrive.events_sp)
+    inputs.healthy = False
+    namespace['update_chestnut_events'](selfdrive)
+    self.assertIn(log.OnroadEvent.EventName.bigModelFailed, selfdrive.events)
+
 
 if __name__ == '__main__':
   unittest.main()
