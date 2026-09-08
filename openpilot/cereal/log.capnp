@@ -132,6 +132,7 @@ struct OnroadEvent @0xc4fa6047f024e718 {
     bigModelLoading @100;
     bigModelFailed @102;
     laneCenteringUnavailable @104;
+    laneCenteringCollisionRisk @105;
 
     lowBatteryDEPRECATED @40;
     soundsUnavailableDEPRECATED @47;
@@ -1104,6 +1105,8 @@ struct ModelDataV2 {
     publishAge @19 :Float32; # camera EOF to status completion immediately before publication, seconds
     frameDelay @20 :Float32; # measured delay estimate used by this frame's inference/actions, seconds
     actionDelay @21 :Float32; # half the filtered valid-publication interval used for lateral action lookahead, seconds
+    collisionRisk @22 :Bool; # predicted physical boundary collision; warning only, never a disengagement request
+    policyFallback @23 :Bool; # rejected lane proposal returned to the native trajectory and action history
   }
 
   lateralPlannerSolutionDEPRECATED @25: Deprecated.LateralPlannerSolution;

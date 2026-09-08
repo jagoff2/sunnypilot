@@ -210,8 +210,10 @@ class SelfdriveD(CruiseHelper):
     )
     if blocked:
       # Existing immediate-disable handling also disengages longitudinal control
-      # and MADS. No blind return to the policy path while steering is requested.
+      # and MADS, but only when a fresh usable model command is unavailable.
       self.events.add(EventName.laneCenteringUnavailable)
+    elif self.lane_centering_safety.collision_risk:
+      self.events.add(EventName.laneCenteringCollisionRisk)
 
   def update_events(self, CS):
     """Compute onroadEvents from carState"""

@@ -25,6 +25,7 @@ HALF_LENGTH = 2.5
 TIMES = np.asarray(ModelConstants.T_IDXS)
 DISTANCES = np.asarray(ModelConstants.X_IDXS)
 FIXTURES = json.loads((Path(__file__).parent / 'fixtures/lane_boundary_regressions.json').read_text())['cases']
+NATIVE_TURN = json.loads((Path(__file__).parent / 'fixtures/native_ninety_degree_turn.json').read_text())
 
 
 def fixture_output(case):
@@ -41,11 +42,11 @@ def fixture_output(case):
   lane_stds = np.broadcast_to(np.asarray(case['lane_std'])[None, :, None, None], lines.shape).copy()
   edge_stds = np.broadcast_to(np.asarray(case['road_edge_std'])[None, :, None, None], edges.shape).copy()
   # Logs expose scalar uncertainty, not the per-point raw confidence head.
-  # Preserve the inspected near geometry, and explicitly leave the far horizon
-  # untrusted instead of inventing confidence from the scalar summary.
+  # Preserve the inspected near geometry. NaN explicitly means the far head is
+  # unknown; a finite sentinel would invent a confidence-threshold crossing.
   confidence_end = DISTANCES[np.searchsorted(DISTANCES, 30.0)]
-  lane_stds[:, :, DISTANCES > confidence_end] = 1.0
-  edge_stds[:, :, DISTANCES > confidence_end] = 1.0
+  lane_stds[:, :, DISTANCES > confidence_end] = np.nan
+  edge_stds[:, :, DISTANCES > confidence_end] = np.nan
   return {'plan': plan, 'lane_lines': lines, 'lane_lines_stds': lane_stds,
           'lane_lines_prob': np.repeat(case['lane_probabilities'], 2)[None],
           'road_edges': edges,
@@ -106,7 +107,8 @@ def selected_step(controller, output, speed, curvature, previous_base=0.0, previ
                                        base, previous_selected, **arguments)
   target = get_curvature_from_plan(selected['plan'][0, :, Plan.T_FROM_CURRENT_EULER.start + 2],
                                    selected['plan'][0, :, Plan.ORIENTATION_RATE.start + 2], TIMES, speed, action_time)
-  action = smooth_value(target, previous_selected, ACTION_SMOOTH_SECONDS, dt=frame_dt)
+  action = base if getattr(status, 'policy_fallback', False) else smooth_value(
+    target, previous_selected, ACTION_SMOOTH_SECONDS, dt=frame_dt)
   return selected, status, base, action
 
 
@@ -255,6 +257,8 @@ def test_recorded_boundary_case_never_labels_intruding_path_contained(case, mirr
   for _ in range(45):
     selected, status, previous_base, previous_selected = selected_step(
       controller, output, case['speed'], curvature, previous_base, previous_selected)
+    assert controller.corridor is not None
+    assert controller.corridor.horizon <= DISTANCES[np.searchsorted(DISTANCES, 30.0)]
   checked_distance = getattr(status, 'checked_distance', 0.0)
   horizon = np.interp(checked_distance, selected['plan'][0, :, Plan.POSITION.start], TIMES)
   _, clearances = footprint_clearances(selected['plan'], output, horizon=horizon)
@@ -291,15 +295,18 @@ def acquired_controller(output, speed=22.0):
 
 @pytest.mark.parametrize('index,value', [(Plan.POSITION.start, 0.1), (Plan.POSITION.start + 1, 0.2),
                                         (Plan.T_FROM_CURRENT_EULER.start + 2, 0.04)])
-def test_malformed_origin_is_repaired_or_blocks(index, value):
+def test_graph_incompatible_native_origin_releases_only_lane_override(index, value):
   output = road_output(22.0, np.array([0., 0., 0.]))
   controller, previous_base, previous_selected = acquired_controller(output)
   output['plan'][0, 0, index] = value
-  selected, status, _, _ = selected_step(controller, output, 22.0, 0.0, previous_base, previous_selected)
-  if not status.safety_blocked:
-    assert status.containment == 'contained'
-    assert np.max(np.abs(selected['plan'][0, 0, Plan.POSITION][:2])) <= 0.05
-    assert abs(selected['plan'][0, 0, Plan.T_FROM_CURRENT_EULER.start + 2]) <= 0.02
+  selected, status, base_action, selected_action = selected_step(controller, output, 22.0, 0.0, previous_base, previous_selected)
+  assert np.array_equal(selected['plan'], output['plan'])
+  assert np.isfinite(selected_action) and selected_action == base_action
+  assert status.path_weight == 0.0
+  assert status.containment == 'unavailable'
+  assert status.reason == 'native_path_geometry'
+  assert not status.safety_blocked
+  assert not status.collision_risk
 
 
 @pytest.mark.parametrize('width', [2.0, 2.15])
@@ -605,6 +612,9 @@ def test_optimized_selection_matches_exhaustive_float32_minimum(name, mirror):
     # nonzero jerk cost forced exact selection to evaluate all 28 responses.
     assert 0 < np.max(abs(controller.filtered_center_y)) < 1e-12
   controller._refresh_corridor(output, speed, curvature, 0.475)
+  if name in {case['name'] for case in FIXTURES}:
+    assert controller.corridor is not None
+    assert controller.corridor.horizon <= DISTANCES[np.searchsorted(DISTANCES, 30.0)]
   if name.startswith('curved_centered'):
     assert controller.corridor.horizon == 192.0
     assert controller.corridor.horizon - HALF_LENGTH - HALF_WIDTH == pytest.approx(188.42)
@@ -656,3 +666,78 @@ def test_active_capped_transition_cannot_raise_weight_above_correction_limit(dir
   correction = abs(selected - base)
   limit = min(lane_core.MAX_CURVATURE_CORRECTION, lane_core.MAX_LATERAL_ACCEL_CORRECTION / speed**2)
   assert status.safety_blocked or correction <= limit + 1e-10, (status, correction * speed**2)
+
+
+def native_turn_output():
+  speed = NATIVE_TURN['speed']
+  output = road_output(speed, np.zeros(3))
+  for group, section in [('position', Plan.POSITION), ('velocity', Plan.VELOCITY), ('acceleration', Plan.ACCELERATION),
+                          ('orientation', Plan.T_FROM_CURRENT_EULER), ('orientationRate', Plan.ORIENTATION_RATE)]:
+    for axis, values in NATIVE_TURN['plan'][group].items():
+      output['plan'][0, :, section.start + 'xyz'.index(axis)] = values
+  output['plan'] = output['plan'].astype(np.float32)
+  output['lane_lines_prob'][:] = 0.0
+  output['road_edges_stds'][:] = 1.0
+  return output
+
+
+@pytest.mark.parametrize('mirror', [False, True], ids=['right_turn', 'left_turn'])
+def test_native_ninety_degree_turn_preserves_control_without_graph_certificate(mirror):
+  output = native_turn_output()
+  if mirror:
+    output = mirror_output(output)
+  original = output['plan'].copy()
+  x = original[0, :, Plan.POSITION.start]
+  yaw = original[0, :, Plan.T_FROM_CURRENT_EULER.start + 2]
+  # Forward body motion through a perpendicular turn can reverse its coordinate
+  # along the initial ego x axis. A graph y(x) is not a native-model contract.
+  assert np.min(np.diff(x)) < -0.09
+  assert np.max(abs(yaw)) > np.pi / 2
+  assert np.all(original[0, :, Plan.VELOCITY.start] > 0)
+  selected, status, base_action, selected_action = selected_step(
+    LaneCenteringController('absolute'), output, NATIVE_TURN['speed'], 0.0)
+  assert np.array_equal(selected['plan'], original)
+  assert selected_action == base_action
+  assert status.path_weight == 0.0
+  assert status.containment == 'unavailable'
+  assert status.reason == 'native_path_geometry'
+  assert not status.safety_blocked
+  assert not status.collision_risk
+
+
+@pytest.mark.parametrize('mirror', [False, True], ids=['left_paint', 'right_paint'])
+@pytest.mark.parametrize('next_knot_std', [0.49, 0.51])
+def test_single_boundary_confidence_at_thirty_metres_does_not_require_next_knot(mirror, next_knot_std):
+  output = road_output(9.6, np.zeros(3))
+  output['lane_lines_prob'][:] = 0.0
+  output['lane_lines_prob'][0, 2:4] = 0.66
+  output['road_edges_stds'][:] = 1.0
+  output['lane_lines_stds'][0, 1, :, :] = 0.24
+  output['lane_lines_stds'][0, 1, 12, :] = 0.46
+  output['lane_lines_stds'][0, 1, 13, :] = next_knot_std
+  # This profile isolates the observed confidence-contract mismatch. Raw
+  # per-point uncertainties were not logged, so it is not an exact head replay.
+  assert DISTANCES[12] == 27.0 and DISTANCES[13] == 31.6875
+  assert np.interp(30.0, DISTANCES, output['lane_lines_stds'][0, 1, :, 0]) < 0.5
+  assert LaneCenteringController._std_valid(output['lane_lines_stds'][0, 1, :, 0], 0.3, 0.5)
+  if mirror:
+    output = mirror_output(output)
+  controller = LaneCenteringController('absolute')
+  selected, status, base_action, selected_action = selected_step(controller, output, 9.6, 0.0)
+  assert controller.corridor is None
+  assert np.array_equal(selected['plan'], output['plan'])
+  assert selected_action == base_action
+  assert status.path_weight == 0.0
+  assert status.containment == 'unavailable'
+  assert not status.safety_blocked
+  assert not status.collision_risk
+
+
+def test_native_turn_fixture_contains_only_relative_numeric_plan_and_speed():
+  assert set(NATIVE_TURN) == {'description', 'speed', 'plan'}
+  assert set(NATIVE_TURN['plan']) == {'position', 'velocity', 'acceleration', 'orientation', 'orientationRate'}
+  for group in NATIVE_TURN['plan'].values():
+    assert set(group) == {'x', 'y', 'z'}
+    for values in group.values():
+      assert len(values) == len(TIMES)
+      assert all(isinstance(value, float) and np.isfinite(value) for value in values)

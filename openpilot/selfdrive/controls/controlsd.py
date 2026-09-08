@@ -54,6 +54,7 @@ class Controls(ControlsExt):
     self.curvature = 0.0
     self.desired_curvature = 0.0
     self.lane_centering_safety = LaneCenteringSafetyLatch()
+    self.selected_model_log_mono_time = 0
 
     self.pose_calibrator = PoseCalibrator()
     self.calibrated_pose: Pose | None = None
@@ -92,6 +93,21 @@ class Controls(ControlsExt):
     steer_angle_without_offset = math.radians(CS.steeringAngleDeg - lp.angleOffsetDeg)
     self.curvature = -self.VM.calc_curvature(steer_angle_without_offset, CS.vEgo, lp.roll)
 
+    model_v2 = self.sm['modelV2']
+    maneuver_active = self.sm.seen['lateralManeuverPlan'] and self.sm.all_checks(['lateralManeuverPlan'])
+    mads = self.sm['selfdriveStateSP'].mads
+    engagement_requested = mads.enabled if mads.available else self.sm['selfdriveState'].enabled
+    command_unusable = False if maneuver_active else self.lane_centering_safety.update(
+      model_v2, self.sm.seen['modelV2'] and self.sm.all_alive(['modelV2']) and self.sm.all_valid(['modelV2']),
+      self.sm.updated['modelV2'], model_clock_ns(), engagement_requested,
+    )
+    if not maneuver_active and self.lane_centering_safety.selected_model is not None:
+      if self.lane_centering_safety.selected_model is model_v2:
+        self.selected_model_log_mono_time = self.sm.logMonoTime['modelV2']
+      model_v2 = self.lane_centering_safety.selected_model
+    elif maneuver_active:
+      self.selected_model_log_mono_time = self.sm.logMonoTime['modelV2']
+
     # Update Torque Params
     if self.CP.lateralTuning.which() == 'torque':
       torque_params = self.sm['lateralTorqueParameters']
@@ -101,12 +117,11 @@ class Controls(ControlsExt):
 
         self.LaC.extension.update_limits()
 
-      self.LaC.extension.update_model_v2(self.sm['modelV2'])
+      self.LaC.extension.update_model_v2(model_v2)
 
       self.LaC.extension.update_lateral_lag(self.lat_delay)
 
     long_plan = self.sm['longitudinalPlan']
-    model_v2 = self.sm['modelV2']
 
     CC = car.CarControl.new_message()
     CC.enabled = self.sm['selfdriveState'].enabled
@@ -116,15 +131,7 @@ class Controls(ControlsExt):
 
     # Get which state to use for active lateral control
     _lat_active = self.get_lat_active(self.sm)
-    maneuver_active = self.sm.seen['lateralManeuverPlan'] and self.sm.all_checks(['lateralManeuverPlan'])
-    mads = self.sm['selfdriveStateSP'].mads
-    engagement_requested = mads.enabled if mads.available else self.sm['selfdriveState'].enabled
-    planner_blocked = False if maneuver_active else self.lane_centering_safety.update(
-      model_v2, self.sm.seen['modelV2'] and self.sm.all_alive(['modelV2']) and self.sm.all_valid(['modelV2']),
-      self.sm.updated['modelV2'], model_clock_ns(), engagement_requested,
-    )
-
-    CC.latActive = _lat_active and not planner_blocked and not CS.steerFaultTemporary and not CS.steerFaultPermanent and \
+    CC.latActive = _lat_active and not command_unusable and not CS.steerFaultTemporary and not CS.steerFaultPermanent and \
                    (not standstill or self.CP.steerAtStandstill)
     CC.longActive = CC.enabled and not any(e.overrideLongitudinal for e in self.sm['onroadEvents']) and \
                     (self.CP.openpilotLongitudinalControl or not self.CP_SP.pcmCruiseSpeed)
@@ -226,7 +233,7 @@ class Controls(ControlsExt):
 
     cs.curvature = self.curvature
     cs.longitudinalPlanMonoTime = self.sm.logMonoTime['longitudinalPlan']
-    cs.lateralPlanMonoTime = self.sm.logMonoTime['modelV2']
+    cs.lateralPlanMonoTime = self.selected_model_log_mono_time
     cs.desiredCurvature = self.desired_curvature
     cs.longControlState = self.LoC.long_control_state
     cs.upAccelCmd = float(self.LoC.pid.p)

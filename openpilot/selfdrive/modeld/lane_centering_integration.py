@@ -111,7 +111,7 @@ class LaneCenteringTelemetry:
   def update(self, mode, status, inputs, original, selected, timestamp_eof, frame_dt, v_ego, base_curvature, selected_curvature, timing=None):
     now = self.clock()
     key = (mode, status.state, status.source, status.reason, status.line_gate, status.edge_gate, status.entry_gate, status.policy_gate,
-           getattr(status, 'containment', 'unavailable'), getattr(status, 'safety_blocked', False),
+           getattr(status, 'containment', 'unavailable'), getattr(status, 'safety_blocked', False), status.collision_risk, status.policy_fallback,
            inputs.ready, inputs.calibration_seen, inputs.services_alive, inputs.services_valid, inputs.services_frequency_ok)
     geometry = None
     if key != self.last_key:
@@ -124,6 +124,8 @@ class LaneCenteringTelemetry:
                                'authority': _finite_number(status.authority), 'path_weight': _finite_number(status.path_weight),
                                'containment': getattr(status, 'containment', 'unavailable'),
                                'safety_blocked': getattr(status, 'safety_blocked', False),
+                               'collision_risk': status.collision_risk,
+                               'policy_fallback': status.policy_fallback,
                                'min_clearance_m': _finite_number(status.min_clearance),
                                'checked_distance_m': _finite_number(status.checked_distance),
                                'response_time_s': _finite_number(status.response_time),
@@ -135,7 +137,7 @@ class LaneCenteringTelemetry:
     # Status NaNs represent unavailable estimates. Encode them as JSON null so
     # route tools can consume this event without permissive NaN JSON parsing.
     status_fields = {key: _finite_number(value) if isinstance(value, float) else value for key, value in asdict(status).items()}
-    cloudlog.event('lane_centering_status', schema_version=1, mode=mode, timestamp_eof=int(timestamp_eof),
+    cloudlog.event('lane_centering_status', schema_version=2, mode=mode, timestamp_eof=int(timestamp_eof),
                    frame_dt_s=_finite_number(frame_dt), speed_mps=_finite_number(v_ego), status=status_fields,
                    inputs=asdict(inputs), base_curvature=_finite_number(base_curvature), selected_curvature=_finite_number(selected_curvature),
                    geometry=geometry if geometry is not None else _geometry_evidence(original, selected),
@@ -246,7 +248,10 @@ class LaneCenteringModelAdapter:
     self.plan_valid = self.plan_valid and _valid_plan(selected_output)
     curvature = math.nan
     if action_valid and self.plan_valid:
-      curvature = _get_lateral_curvature(selected_output, self.previous_selected_action.desiredCurvature, v_ego, lat_action_t, smoothing_dt)
+      # A rejected lane proposal cannot continue steering through its retained
+      # selected-filter history. The core returns the original policy plan.
+      curvature = base_action.desiredCurvature if status.policy_fallback else _get_lateral_curvature(
+        selected_output, self.previous_selected_action.desiredCurvature, v_ego, lat_action_t, smoothing_dt)
     action_valid = action_valid and math.isfinite(curvature)
     self.frame_valid = self.frame_valid and action_valid
     if self.frame_valid:
@@ -297,6 +302,8 @@ class LaneCenteringModelAdapter:
     selected.responseTime = status.response_time
     selected.checkedDistance = status.checked_distance
     selected.safetyBlocked = status.safety_blocked
+    selected.collisionRisk = status.collision_risk
+    selected.policyFallback = status.policy_fallback
     selected.lineGate = status.line_gate
     selected.edgeGate = status.edge_gate
     selected.entryGate = status.entry_gate

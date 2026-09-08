@@ -13,7 +13,7 @@ import pytest
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
 from openpilot.selfdrive.modeld.lane_path import (
   CHECK_STEP, CLEARANCE_BUFFER, HALF_LENGTH, HALF_WIDTH, MODEL_X, TIME, Corridor, LanePath, LaneReference,
-  build_lane_candidates, build_sparse_lane_candidates, dynamics_grid, evaluate_lane_dynamics, lane_dynamics_lower_bounds,
+  build_lane_candidates, build_sparse_lane_candidates, dynamics_grid, evaluate_lane_dynamics, lane_dynamics_lower_bounds, road_edge_collision,
 )
 
 
@@ -646,3 +646,110 @@ def test_constant_and_variable_speed_rows_keep_scalar_dynamics_exact(dtype):
   np.testing.assert_array_equal(acceleration, expected[:, 0])
   np.testing.assert_array_equal(jerk, expected[:, 1])
   assert np.all(lower_a <= expected[:, 0]) and np.all(lower_j <= expected[:, 1])
+
+
+def warning_edges(half_width=1.8, uncertainty=.03):
+  return {'left_edge': np.full_like(MODEL_X, -half_width), 'right_edge': np.full_like(MODEL_X, half_width),
+          'left_uncertainty': np.full_like(MODEL_X, uncertainty), 'right_uncertainty': np.full_like(MODEL_X, uncertainty)}
+
+
+@pytest.mark.parametrize('direction', [-1., 1.])
+@pytest.mark.parametrize('motion', [False, True])
+def test_road_edge_warning_requires_explicit_predicted_body_contact(direction, motion):
+  plan = straight_plan()
+  if motion:
+    plan[0, :, Plan.T_FROM_CURRENT_EULER.start + 2] = direction * .05 * TIME
+    # Published centers stay straight, and even their rotated corners fit.
+    assert np.min(flat_corridor().margins(10. * TIME[TIME <= 2.], np.zeros(sum(TIME <= 2.)), direction * .05 * TIME[TIME <= 2.])) > 0.
+  else:
+    plan[0, :, Plan.POSITION.start + 1] = direction * .5 * TIME
+  risk, margin = road_edge_collision(plan, **warning_edges())
+  assert risk and np.isfinite(margin) and margin < -.1
+
+
+def test_narrow_painted_lane_does_not_imply_road_edge_collision():
+  plan = straight_plan()
+  assert not flat_corridor(.8).check(plan)[0]
+  assert road_edge_collision(plan)[0] is False
+  assert road_edge_collision(plan, **warning_edges(3.0))[0] is False
+
+
+@pytest.mark.parametrize('uncertainty,expected', [(.03, True), (.4, False), (.41, False)])
+def test_road_edge_warning_notch_requires_penetration_beyond_uncertainty(uncertainty, expected):
+  edges = warning_edges(3., uncertainty)
+  edges['right_edge'][5] = .7
+  risk, margin = road_edge_collision(straight_plan(), **edges)
+  assert risk is expected
+  if expected:
+    assert margin < 0.
+
+
+def test_wide_noisy_road_and_failed_dynamics_do_not_trigger_collision_warning():
+  rng = np.random.default_rng(42)
+  edges = warning_edges(3., .3)
+  edges['left_edge'] += rng.normal(0., .15, len(MODEL_X))
+  edges['right_edge'] += rng.normal(0., .15, len(MODEL_X))
+  plan = straight_plan()
+  plan[0, :, Plan.ACCELERATION.start + 1] = 100.
+  assert not road_edge_collision(plan, **edges)[0]
+
+
+def test_warning_ignores_unsupported_geometry_and_corners_beyond_observed_horizon():
+  plan = straight_plan()
+  plan[0, :, Plan.POSITION.start + 1] = np.maximum(TIME - 1.5, 0.) * 3.
+  edges = warning_edges()
+  assert not road_edge_collision(plan, horizon=10., **edges)[0]
+  edges['right_uncertainty'][7:] = np.nan
+  assert not road_edge_collision(plan, **edges)[0]
+
+
+@pytest.mark.parametrize('tail', ['reverse', 'nan'])
+def test_warning_keeps_supported_prediction_when_far_tail_is_reversed_or_malformed(tail):
+  plan = straight_plan()
+  if tail == 'reverse':
+    plan[0, 29:, Plan.POSITION.start] = -100.
+    plan[0, 29:, Plan.POSITION.start + 1] = 100.
+  else:
+    plan[0, 29:, Plan.POSITION] = np.nan
+  assert not flat_corridor().check(plan)[0]
+  assert not road_edge_collision(plan, **warning_edges())[0]
+  plan[0, :20, Plan.POSITION.start + 1] = .5 * TIME[:20]
+  assert road_edge_collision(plan, **warning_edges())[0]
+
+
+def test_warning_can_use_one_credible_physical_edge_and_preserves_near_evidence_before_far_nan():
+  plan = straight_plan()
+  plan[0, :, Plan.POSITION.start + 1] = .5 * TIME
+  edges = warning_edges()
+  edges['left_edge'] = edges['left_uncertainty'] = None
+  edges['right_edge'][-1] = np.nan
+  assert road_edge_collision(plan, **edges)[0]
+
+
+@pytest.mark.parametrize('invalid', [None, np.zeros((3, 3)), 'malformed'])
+def test_unavailable_plan_is_not_collision_evidence(invalid):
+  risk, margin = road_edge_collision(invalid, **warning_edges())
+  assert risk is False and np.isnan(margin)
+
+
+def test_containment_buffer_failure_is_not_explicit_road_edge_contact():
+  plan = straight_plan()
+  edge_distance = HALF_WIDTH + CLEARANCE_BUFFER / 2
+  assert not flat_corridor(edge_distance).check(plan)[0]
+  risk, margin = road_edge_collision(plan, **warning_edges(edge_distance, 0.))
+  assert risk is False and margin > 0.
+
+
+def test_warning_does_not_reinterpret_a_returning_spatial_branch_as_forward_road():
+  plan = straight_plan()
+  plan[0, :, Plan.POSITION.start] = np.where(TIME <= .8, 10. * TIME, 8. - 2. * (TIME - .8))
+  plan[0, :, Plan.POSITION.start + 1] = np.maximum(TIME - 1.2, 0.) * 20.
+  plan[0, :, Plan.VELOCITY.start] = 0.
+  assert not road_edge_collision(plan, **warning_edges())[0]
+
+
+def test_warning_rejects_malformed_origin_instead_of_treating_it_as_body_contact():
+  plan = straight_plan()
+  plan[0, 0, Plan.POSITION.start + 1] = 10.
+  risk, margin = road_edge_collision(plan, **warning_edges())
+  assert risk is False and np.isnan(margin)

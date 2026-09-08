@@ -508,6 +508,7 @@ def main(demo=False):
       drivingdata_send.drivingModelData.meta.laneChangeDirection = DH.lane_change_direction
 
       fill_pose_msg(posenet_send, model_output, meta_main.frame_id, vipc_dropped_frames, meta_main.timestamp_eof, live_calib_seen)
+      modelv2_send.valid = modelv2_send.valid and lane_centering.frame_valid
       lane_centering.fill_status(modelv2_send.modelV2, lane_centering_status)
       pm.send('modelV2', modelv2_send)
       pm.send('drivingModelData', drivingdata_send)

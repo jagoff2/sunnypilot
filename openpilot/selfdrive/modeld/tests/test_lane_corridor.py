@@ -72,15 +72,15 @@ def test_near_malformed_claimed_paint_blocks_instead_of_widening_or_holding(head
   assert status.safety_blocked
 
 
-def test_unsupported_interpolation_bracket_cannot_invent_thirty_metre_horizon():
+def test_finite_uncertainty_crossing_preserves_only_its_trusted_prefix():
   output = road()
   controller = core.LaneCenteringController('absolute')
   bracket = np.searchsorted(MODEL_X, 30.)
   output['lane_lines_stds'][0, 2, bracket, :] = .6
   refresh(controller, output)
-  assert controller.safety_blocked
-  assert controller.corridor is None
-  assert controller.safety_reason == 'corridor_invalid'
+  assert not controller.safety_blocked
+  assert 30. < controller.corridor.horizon < MODEL_X[bracket]
+  np.testing.assert_allclose(controller.corridor.right, 1.8)
 
 
 @pytest.mark.parametrize('side', [0, 1])

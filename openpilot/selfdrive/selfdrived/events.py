@@ -240,8 +240,16 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   },
 
   EventName.laneCenteringUnavailable: {
-    ET.NO_ENTRY: NoEntryAlert("Lateral Planning Unavailable"),
-    ET.IMMEDIATE_DISABLE: ImmediateDisableAlert("Lateral Planning Unavailable"),
+    ET.NO_ENTRY: NoEntryAlert("Steering Command Unavailable"),
+    ET.IMMEDIATE_DISABLE: ImmediateDisableAlert("Steering Command Unavailable"),
+  },
+
+  EventName.laneCenteringCollisionRisk: {
+    ET.WARNING: Alert(
+      "Take Control",
+      "Road Boundary Collision Risk",
+      AlertStatus.userPrompt, AlertSize.mid,
+      Priority.HIGH, VisualAlert.steerRequired, AudibleAlert.promptRepeat, 1.),
   },
 
   EventName.lateralManeuver: {

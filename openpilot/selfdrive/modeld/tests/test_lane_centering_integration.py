@@ -365,6 +365,16 @@ class TestLaneCenteringIntegration(unittest.TestCase):
         self.assertLess(source.index('fill_model_msg('), source.index('lane_centering.fill_status('))
         self.assertLess(source.index('fill_pose_msg('), source.index('lane_centering.fill_status('))
         self.assertLess(source.index('lane_centering.fill_status('), source.rindex("pm.send('modelV2'"))
+        validity = next(node for node in ast.walk(main) if isinstance(node, ast.Assign) and
+                        any(ast.unparse(target) == 'modelv2_send.valid' for target in node.targets))
+        # Execute the actual runner assignment: held actions cannot masquerade
+        # as fresh native commands even when plan serialization succeeds.
+        for native_valid in (False, True):
+          for action_valid in (False, True):
+            message = SimpleNamespace(valid=native_valid)
+            namespace = {'modelv2_send': message, 'lane_centering': SimpleNamespace(frame_valid=action_valid)}
+            exec(compile(ast.Module(body=[validity], type_ignores=[]), relative, 'exec'), namespace)
+            self.assertEqual(message.valid, native_valid and action_valid)
 
   def test_nonmonotonic_camera_timestamps_reach_controller_as_invalid_elapsed_time(self):
     native = native_actions()[0][1]
@@ -427,7 +437,7 @@ class TestLaneCenteringIntegration(unittest.TestCase):
         self.assertIs(adapter.previous_selected_action, previous)
         self.assertIs(action, previous)
 
-  def test_cold_engagement_consumes_preflight_decision_before_any_steering_authority(self):
+  def test_cold_engagement_preserves_usable_policy_command_when_geometry_cannot_be_certified(self):
     native = native_actions()[0][1]
     for narrow in (False, True):
       with self.subTest(narrow=narrow):
@@ -445,10 +455,10 @@ class TestLaneCenteringIntegration(unittest.TestCase):
         self.assertTrue(model.laneCentering.valid)
         guard = LaneCenteringSafetyLatch()
         now = model.timestampEof + 150_000_000
-        self.assertEqual(guard.update(model, True, True, now, False), narrow)
+        self.assertFalse(guard.update(model, True, True, now, False))
         # A control tick may receive the enable request before the next model
-        # frame. It must already have a checked action or prohibit engagement.
-        self.assertEqual(guard.update(model, True, False, now, True), narrow)
+        # frame. Geometry uncertainty alone cannot prohibit engagement.
+        self.assertFalse(guard.update(model, True, False, now, True))
 
   def test_capped_mode_blocks_unsafe_handoff_that_requires_instant_full_path_weight(self):
     native, output = native_actions()[0][1], model_output()
@@ -557,16 +567,19 @@ class TestLaneCenteringIntegration(unittest.TestCase):
     adapter.last_timestamp_eof = 1_000_000_000
     adapter.execution_time = 0.025
     fields = asdict(adapter.controller._status())
-    fields.update(containment='blocked', min_clearance=-0.2, response_time=1.5, checked_distance=62.5, safety_blocked=True)
+    fields.update(containment='blocked', min_clearance=-0.2, response_time=1.5, checked_distance=62.5, safety_blocked=True,
+                  collision_risk=True, policy_fallback=True)
     status = SimpleNamespace(**fields)
     model = log.ModelDataV2.new_message(frameId=9, timestampEof=adapter.last_timestamp_eof)
     with patch('openpilot.selfdrive.modeld.lane_centering_integration.model_clock_ns', return_value=1_080_000_000):
       adapter.fill_status(model, status)
-    self.assertEqual(model.laneCentering.version, 1)
+    self.assertEqual(model.laneCentering.version, 2)
     self.assertTrue(model.laneCentering.valid)
     self.assertEqual(model.laneCentering.frameId, model.frameId)
     self.assertEqual(model.laneCentering.timestampEof, model.timestampEof)
     self.assertTrue(model.laneCentering.safetyBlocked)
+    self.assertTrue(model.laneCentering.collisionRisk)
+    self.assertTrue(model.laneCentering.policyFallback)
     self.assertAlmostEqual(model.laneCentering.minClearance, -0.2)
     self.assertAlmostEqual(model.laneCentering.checkedDistance, 62.5)
     self.assertAlmostEqual(model.laneCentering.responseTime, 1.5)
@@ -578,6 +591,24 @@ class TestLaneCenteringIntegration(unittest.TestCase):
     model.timestampEof += 1
     adapter.fill_status(model, status)
     self.assertFalse(model.laneCentering.valid)
+
+  def test_rejected_lane_proposal_uses_native_plan_and_base_action_history(self):
+    for name, native in native_actions():
+      with self.subTest(model=name):
+        adapter, inputs, output = LaneCenteringModelAdapter(), Inputs(), model_output()
+        adapter.previous_base_action = log.ModelDataV2.Action(desiredCurvature=-0.003, desiredAcceleration=0.2)
+        adapter.previous_selected_action = log.ModelDataV2.Action(desiredCurvature=0.009, desiredAcceleration=0.2)
+        status = replace(adapter.controller._status(), reason='correction_limit', containment='blocked',
+                         safety_blocked=True, policy_fallback=True)
+        with patch.object(adapter.controller, 'update', return_value=(output, status)):
+          selected, action, actual_status = self.run_frames(adapter, output, native, inputs)
+        self.assertIs(selected, output)
+        self.assertTrue(adapter.frame_valid)
+        self.assertTrue(actual_status.policy_fallback)
+        self.assertAlmostEqual(action.desiredCurvature, smooth_value(0.0, -0.003, ACTION_SMOOTH_SECONDS), places=8)
+        self.assertEqual(action.desiredCurvature, adapter.previous_base_action.desiredCurvature)
+        self.assertIs(action, adapter.previous_selected_action)
+        self.assertEqual(actual_status.curvature_correction, 0.0)
 
   def test_invalid_plans_and_actions_preserve_finite_history_and_recover(self):
     for name, native in native_actions():

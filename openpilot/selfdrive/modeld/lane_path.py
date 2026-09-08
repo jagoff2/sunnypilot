@@ -635,3 +635,115 @@ class Corridor:
     initial = self.initial_margin()
     valid = valid and initial + allowance[0] >= -1e-6
     return bool(valid), float(min(np.min(margins), initial))
+
+
+def road_edge_collision(plan, left_edge=None, right_edge=None, left_uncertainty=None, right_uncertainty=None,
+                        horizon=192.0, prediction_seconds=2.0, half_length=HALF_LENGTH, half_width=HALF_WIDTH):
+  """Warn only on explicit predicted footprint overlap with physical road edges.
+
+  A negative returned margin is penetration beyond two positional standard
+  deviations plus 5 cm. Unavailable geometry and failed containment proofs are
+  not collision evidence. This warning samples the first forward time branch;
+  it neither certifies clearance between samples nor controls steering.
+  """
+  try:
+    plan = np.asarray(plan, dtype=float)
+  except (TypeError, ValueError):
+    return False, np.nan
+  if (plan.shape != (1, ModelConstants.IDX_N, ModelConstants.PLAN_WIDTH) or
+      not all(np.isfinite(v) and v > 0. for v in (horizon, prediction_seconds, half_length, half_width))):
+    return False, np.nan
+  sides = []
+  for side, (edge, uncertainty) in enumerate(((left_edge, left_uncertainty), (right_edge, right_uncertainty))):
+    if edge is None or uncertainty is None:
+      continue
+    try:
+      edge, uncertainty = np.asarray(edge, dtype=float), np.asarray(uncertainty, dtype=float)
+    except (TypeError, ValueError):
+      continue
+    if edge.shape != MODEL_X.shape or uncertainty.shape != MODEL_X.shape:
+      continue
+    credible = np.isfinite(edge) & np.isfinite(uncertainty) & (uncertainty >= 0.) & (uncertainty <= .4)
+    unsupported = np.flatnonzero(~credible)
+    last = int(unsupported[0] - 1) if len(unsupported) else len(MODEL_X) - 1
+    if last < 1:
+      continue
+    limit = min(float(horizon), float(MODEL_X[last]))
+    knots = np.unique(np.r_[MODEL_X[MODEL_X < limit], limit])
+    slope_bound = float(np.max(abs(np.diff(edge[:last + 1]) / np.diff(MODEL_X[:last + 1]))))
+    sides.append((side, edge[:last + 1], uncertainty[:last + 1], MODEL_X[:last + 1], limit, knots, slope_bound))
+  if not sides:
+    return False, np.nan
+
+  px, py = plan[0, :, Plan.POSITION.start], plan[0, :, Plan.POSITION.start + 1]
+  heading = plan[0, :, Plan.T_FROM_CURRENT_EULER.start + 2]
+  if not all(np.isfinite(v) for v in (px[0], py[0], heading[0])) or abs(px[0]) > .1 or abs(py[0]) > .1 or abs(heading[0]) > .05:
+    return False, np.nan
+  valid = np.isfinite(px) & np.isfinite(py) & np.isfinite(heading)
+  invalid = np.flatnonzero(~valid)
+  last = int(invalid[0] - 1) if len(invalid) else len(TIME) - 1
+  if last < 1:
+    return False, np.nan
+  end = min(float(prediction_seconds), float(TIME[last]))
+  t = np.unique(np.r_[TIME[TIME < end], np.arange(0., end, .05), end])
+  yaw = np.interp(t, TIME[:last + 1], np.unwrap(heading[:last + 1]))
+  x, y = np.interp(t, TIME[:last + 1], px[:last + 1]), np.interp(t, TIME[:last + 1], py[:last + 1])
+  predictions = [(x, y, yaw, np.zeros_like(t))]
+
+  # Independently inspect the motion implied by heading and body-frame velocity.
+  # Native time knots are included, so every integration interval has linear
+  # velocity/heading interpolation. Numerical uncertainty reduces the evidence
+  # of contact; it never inflates the body into an obstacle.
+  vx, vy = plan[0, :, Plan.VELOCITY.start], plan[0, :, Plan.VELOCITY.start + 1]
+  velocity_valid = np.isfinite(vx) & np.isfinite(vy)
+  invalid = np.flatnonzero(~velocity_valid)
+  velocity_last = int(invalid[0] - 1) if len(invalid) else len(TIME) - 1
+  if velocity_last >= 1:
+    motion_t = t[t <= TIME[min(last, velocity_last)]]
+    if len(motion_t) > 1:
+      mx = np.interp(motion_t, TIME[:velocity_last + 1], vx[:velocity_last + 1])
+      my = np.interp(motion_t, TIME[:velocity_last + 1], vy[:velocity_last + 1])
+      mh = yaw[:len(motion_t)]
+      dt = np.diff(motion_t)
+      vmx, vmy, hm = (mx[:-1] + mx[1:]) / 2, (my[:-1] + my[1:]) / 2, (mh[:-1] + mh[1:]) / 2
+      dx = dt / 6 * (mx[:-1]*np.cos(mh[:-1]) - my[:-1]*np.sin(mh[:-1]) +
+                    4*(vmx*np.cos(hm) - vmy*np.sin(hm)) + mx[1:]*np.cos(mh[1:]) - my[1:]*np.sin(mh[1:]))
+      dy = dt / 6 * (mx[:-1]*np.sin(mh[:-1]) + my[:-1]*np.cos(mh[:-1]) +
+                    4*(vmx*np.sin(hm) + vmy*np.cos(hm)) + mx[1:]*np.sin(mh[1:]) + my[1:]*np.cos(mh[1:]))
+      omega = abs(np.diff(mh) / dt)
+      speed = np.maximum(np.hypot(mx[:-1], my[:-1]), np.hypot(mx[1:], my[1:]))
+      body_accel = np.hypot(np.diff(mx), np.diff(my)) / dt
+      error = np.r_[0., np.cumsum(dt**5 / 2880 * (speed * omega**4 + 4 * body_accel * omega**3))]
+      predictions.append((np.r_[0., np.cumsum(dx)], np.r_[0., np.cumsum(dy)], mh, error))
+
+  minimum = np.inf
+  bx = np.array([-half_length, half_length, half_length, -half_length])
+  by = np.array([-half_width, -half_width, half_width, half_width])
+  for x, y, yaw, error in predictions:
+    reversal = np.flatnonzero(np.diff(x) < -1e-6)
+    count = int(reversal[0] + 1) if len(reversal) else len(x)
+    x, y, yaw, error = x[:count], y[:count], yaw[:count], error[:count]
+    cosine, sine = np.cos(yaw)[:, None], np.sin(yaw)[:, None]
+    cx, cy = x[:, None] + cosine*bx - sine*by, y[:, None] + sine*bx + cosine*by
+    nx, ny = np.roll(cx, -1, axis=1), np.roll(cy, -1, axis=1)
+    dx = nx - cx
+    for side, edge, uncertainty, edge_x, limit, knots, slope_bound in sides:
+      numeric_margin = error * (1 + slope_bound)
+      credible_corners = (cx - error[:, None] >= 0.) & (cx + error[:, None] <= limit)
+      boundary = np.interp(cx, edge_x, edge)
+      clearance = cy - boundary if side == 0 else boundary - cy
+      margin = clearance + 2*np.interp(cx, edge_x, uncertainty) + .05 + numeric_margin[:, None]
+      candidates = np.where(credible_corners & np.isfinite(margin), margin, np.inf)
+      minimum = min(minimum, float(np.min(candidates)))
+      # A boundary notch may intersect a body side between corners. These are
+      # actual rectangle edges at one predicted pose, not a swept convex hull.
+      fraction = (knots[None, None, :] - cx[:, :, None]) / np.where(abs(dx) > 1e-9, dx, 1.)[:, :, None]
+      crosses = (abs(dx)[:, :, None] > 1e-9) & (fraction >= 0.) & (fraction <= 1.)
+      crosses &= (knots[None, None, :] - error[:, None, None] >= 0.) & (knots[None, None, :] + error[:, None, None] <= limit)
+      crossing_y = cy[:, :, None] + fraction * (ny - cy)[:, :, None]
+      boundary = np.interp(knots, edge_x, edge)
+      clearance = crossing_y - boundary if side == 0 else boundary - crossing_y
+      margin = clearance + 2*np.interp(knots, edge_x, uncertainty) + .05 + numeric_margin[:, None, None]
+      candidates = np.where(crosses & np.isfinite(margin), margin, np.inf)
+      minimum = min(minimum, float(np.min(candidates)))
+  return bool(minimum < 0.), float(minimum) if np.isfinite(minimum) else np.nan
