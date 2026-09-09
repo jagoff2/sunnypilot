@@ -1,18 +1,15 @@
 """Use the C3X selected lateral trajectory with C4 longitudinal actions."""
-import logging
 from dataclasses import replace
 from types import SimpleNamespace
 
 from openpilot.cereal import log
 from openpilot.common.realtime import DT_MDL
+from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.drive_helpers import get_curvature_from_plan, smooth_value
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
 from openpilot.selfdrive.modeld.lane_centering import (
   ACTION_SMOOTH_SECONDS, LaneCenteringController, get_lane_centering_input_status,
 )
-
-
-logger = logging.getLogger(__name__)
 
 
 def _get_lateral_curvature(model_output, previous_curvature, v_ego, lat_action_t):
@@ -47,6 +44,7 @@ class LaneCenteringModelAdapter:
     self.previous_selected_action = log.ModelDataV2.Action()
     self.last_timestamp_eof = None
     self.last_log_key = None
+    self.last_log_timestamp = None
 
   def update(self, model_output, action_from_model, sm, calibration_seen, lane_change_state,
              timestamp_eof, v_ego, lat_action_t, long_action_t):
@@ -89,9 +87,15 @@ class LaneCenteringModelAdapter:
     self.previous_base_action = base_action
     self.previous_selected_action = action
     key = (status.state, status.source, status.reason, status.line_gate, status.edge_gate, status.policy_gate)
-    if key != self.last_log_key:
-      logger.info("lane centering mode=%s state=%s source=%s reason=%s authority=%.3f path_weight=%.3f correction=%.5f",
-                  self.controller.mode, status.state, status.source, status.reason,
-                  status.authority, status.path_weight, status.curvature_correction)
+    log_due = self.last_log_timestamp is None or timestamp_eof < self.last_log_timestamp or timestamp_eof - self.last_log_timestamp >= 1_000_000_000
+    if log_due and (key != self.last_log_key or status.authority > 0.0):
+      cloudlog.info("lane centering mode=%s state=%s source=%s reason=%s authority=%.3f path_weight=%.3f correction=%.5f "
+                    "geometry_horizon=%.1f convergence_distance=%.1f convergence_time=%.2f horizon_limited=%s "
+                    "policy_disagreement=%.3f line_gate=%s edge_gate=%s policy_gate=%s",
+                    self.controller.mode, status.state, status.source, status.reason,
+                    status.authority, status.path_weight, status.curvature_correction,
+                    status.geometry_horizon, status.convergence_distance, status.convergence_time, status.horizon_limited,
+                    status.policy_disagreement, status.line_gate, status.edge_gate, status.policy_gate)
       self.last_log_key = key
+      self.last_log_timestamp = timestamp_eof
     return selected_output, action, status
