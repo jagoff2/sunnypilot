@@ -36,7 +36,7 @@ from openpilot.system import sentry
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
 from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, smooth_value
-from openpilot.selfdrive.modeld.lane_centering_integration import LaneCenteringModelAdapter, update_lane_change_helpers
+from openpilot.selfdrive.modeld.lane_centering_integration import LaneCenteringModelAdapter, fill_lane_centering_status, update_lane_change_helpers
 from openpilot.selfdrive.modeld.lane_centering import ACTION_SMOOTH_SECONDS
 
 from openpilot.sunnypilot.modeld_v2.fill_model_msg import fill_model_msg, fill_pose_msg, PublishState, get_curvature_from_output
@@ -44,7 +44,7 @@ from openpilot.sunnypilot.modeld_v2.constants import Plan
 from openpilot.sunnypilot.modeld_v2.meta_helper import load_meta_constants
 from openpilot.sunnypilot.modeld_v2.camera_offset_helper import CameraOffsetHelper
 from openpilot.sunnypilot.modeld_v2.compile_modeld import derive_frame_skip, make_split_input_queues, make_supercombo_input_queues, WARP_INPUTS, POLICY_INPUTS
-from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
+from openpilot.sunnypilot.livedelay.helpers import get_initial_lat_delay, get_lat_delay
 from openpilot.sunnypilot.modeld_v2.modeld_base import ModelStateBase
 from openpilot.sunnypilot.models.helpers import get_active_bundle
 from openpilot.sunnypilot.selfdrive.controls.lib.relc import RoadEdgeLaneChangeController
@@ -376,6 +376,8 @@ def main(demo=False):
   else:
     CP = messaging.log_from_bytes(params.get("CarParams", block=True), car.CarParams)
   cloudlog.info("modeld got CarParams: %s", CP.brand)
+  fallback_lat_delay = get_initial_lat_delay(CP.steerActuatorDelay)
+  model.lat_delay = get_lat_delay(params, fallback_lat_delay, fallback_lat_delay)
 
   # TODO Move smooth seconds to action function
   long_delay = CP.longitudinalActuatorDelay + model.LONG_SMOOTH_SECONDS
@@ -425,7 +427,7 @@ def main(demo=False):
     frame_id = sm["narrowRoadCameraState"].frameId
     v_ego = max(sm["carState"].vEgo, 0.)
     if sm.frame % 60 == 0:
-      model.lat_delay = get_lat_delay(params, sm["lateralDelay"].lateralDelay)
+      model.lat_delay = get_lat_delay(params, sm["lateralDelay"].lateralDelay, fallback_lat_delay)
       model.PLANPLUS_CONTROL = params.get("PlanplusControl", return_default=True)
       camera_offset_helper.set_offset(params.get("CameraOffset", return_default=True))
     lat_delay = model.lat_delay + ACTION_SMOOTH_SECONDS
@@ -486,7 +488,7 @@ def main(demo=False):
 
       update_lane_change_helpers(model_output, sm['carState'], sm['carControl'].latActive, v_ego,
                                  DH, RELC, mdv2sp_send.modelDataV2SP)
-      selected_model_output, action, _ = lane_centering.update(
+      selected_model_output, action, lane_status = lane_centering.update(
         model_output, model.get_action_from_model, sm, live_calib_seen, DH.lane_change_state,
         meta_main.timestamp_eof, v_ego, lat_action_t, long_action_t,
       )
@@ -494,6 +496,7 @@ def main(demo=False):
                      publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
                      frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, live_calib_seen, meta_constants[model.chestnut])
       modelv2_send.modelV2.big = model.chestnut
+      fill_lane_centering_status(modelv2_send.modelV2, model_output, lane_status, lane_centering.controller.mode)
 
       modelv2_send.modelV2.meta.laneChangeState = DH.lane_change_state
       modelv2_send.modelV2.meta.laneChangeDirection = DH.lane_change_direction

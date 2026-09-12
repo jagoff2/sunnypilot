@@ -176,7 +176,7 @@ class TestAdaptiveLaneCentering(unittest.TestCase):
       controller.filtered_center_y = np.full_like(MODEL_X, 0.44)
       plan, join = controller._build_lane_plan(self.straight_plan(16.0), 16.0, 0.0)
       self.assert_feasible(plan)
-      self.assertLess(join / 16.0, 2.75)
+      self.assertAlmostEqual(join / 16.0, 2.75)
       self.assertGreater(float(np.interp(1.0, ModelConstants.T_IDXS, plan[0, :, Plan.POSITION.start + 1])), 0.1)
       plans.append(plan)
       joins.append(join)
@@ -246,7 +246,8 @@ class TestAdaptiveLaneCentering(unittest.TestCase):
     output['plan'] = self.straight_plan(40.0)
     selected = controller._select_output(output, 40.0, 0.0, 0.475, 0.0, 0.0)
     self.assertIs(selected, output)
-    self.assertEqual(controller.authority, 0.0)
+    self.assertEqual(controller.state, "active")
+    self.assertEqual(controller.last_path_weight, 0.0)
     self.assertEqual(controller.reason, "geometry_support_short")
 
   def test_typical_straight_and_curved_plans_obey_whole_plan_dynamics(self):

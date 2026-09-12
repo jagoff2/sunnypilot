@@ -916,6 +916,16 @@ struct ControlsState @0x97ff69c53601abf1 {
     desiredLateralAccel @10 :Float32;
     desiredLateralJerk @11 :Float32;
     version @12 :Int32;
+    rawDesiredLateralAccel @13 :Float32;  # m/s^2, before controller shaping
+    feedbackLateralAccel @14 :Float32;  # m/s^2, target used by feedback
+    actualLateralJerk @15 :Float32;  # m/s^3, measured acceleration derivative
+    yawLateralAccel @16 :Float32;  # m/s^2, calibrated yaw rate times speed
+    steeringRateDeg @17 :Float32;
+    preLimitOutput @18 :Float32;  # normalized steering torque, same sign as output
+    appliedOutput @19 :Float32;  # normalized carOutput torque
+    outputLimited @20 :Bool;
+    appliedOutputValid @21 :Bool;
+    feedbackDelay @22 :Float32;  # seconds
    }
 
   struct LateralAngleState {
@@ -1076,6 +1086,48 @@ struct ModelDataV2 {
 
   # e2e lateral planner
   action @26: Action;
+  laneCentering @28 :LaneCentering;
+
+  struct LaneCentering {
+    present @0 :Bool;
+    mode @1 :Text;
+    state @2 :Text;
+    source @3 :Text;
+    reason @4 :Text;
+    authority @5 :Float32;
+    pathWeight @6 :Float32;
+    geometryHorizon @7 :Float32;
+    convergenceDistance @8 :Float32;
+    convergenceTime @9 :Float32;
+    horizonLimited @10 :Bool;
+    policyDisagreement @11 :Float32;
+    laneWidth @12 :Float32;
+    centerOffset @13 :Float32;
+    lineGate @14 :Text;
+    edgeGate @15 :Text;
+    entryGate @16 :Text;
+    policyGate @17 :Text;
+    lanePathFeasibility @18 :Float32;
+    baseCurvature @19 :Float32;
+    selectedCurvatureRaw @20 :Float32;
+    selectedCurvature @21 :Float32;
+    actionLimited @22 :Bool;
+    requestedLateralJerk @23 :Float32;
+    frameDt @24 :Float32;
+    modelTimestampEof @25 :UInt64;
+    actionTime @26 :Float32;
+    basePosition @27 :XYZTData;
+    baseOrientation @28 :XYZTData;
+    baseOrientationRate @29 :XYZTData;
+    baseVelocity @30 :XYZTData;
+    baseAcceleration @31 :XYZTData;
+    basePlanValid @32 :Bool;
+    # Full native lateral uncertainty, boundary-major then distance-major.
+    laneBoundaryStds @33 :List(Float32);
+    roadBoundaryStds @34 :List(Float32);
+    nativeCurvature @35 :Float32;
+    requestedCurvature @36 :Float32;
+  }
 
   lateralPlannerSolutionDEPRECATED @25: Deprecated.LateralPlannerSolution;
   leadsDEPRECATED @11 :List(LeadDataV2DEPRECATED);

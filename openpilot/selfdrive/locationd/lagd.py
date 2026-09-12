@@ -15,6 +15,7 @@ from openpilot.common.realtime import config_realtime_process
 from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.locationd.helpers import PoseCalibrator, Pose, fft_next_good_size, parabolic_peak_interp
 from openpilot.sunnypilot.livedelay.lagd_toggle import LagdToggle
+from openpilot.sunnypilot.livedelay.helpers import MIN_LAT_DELAY, MAX_LAT_DELAY, get_initial_lat_delay
 
 BLOCK_SIZE = 100
 BLOCK_NUM = 50
@@ -26,8 +27,8 @@ MIN_VEGO = 50.0 * CV.MPH_TO_MS
 MIN_ABS_YAW_RATE = 0.0
 MAX_YAW_RATE_SANITY_CHECK = 1.0
 MIN_NCC = 0.95
-MAX_LAG = 0.65
-MIN_LAG = 0.15
+MAX_LAG = MAX_LAT_DELAY
+MIN_LAG = MIN_LAT_DELAY
 MAX_LAG_STD = 0.1
 MAX_LAT_ACCEL = 2.0
 MAX_LAT_ACCEL_DIFF = 0.6
@@ -183,7 +184,7 @@ class LateralLagEstimator:
     self.window_sec = window_sec
     self.okay_window_sec = okay_window_sec
     self.min_recovery_buffer_sec = min_recovery_buffer_sec
-    self.initial_lag = CP.steerActuatorDelay + 0.2
+    self.initial_lag = get_initial_lat_delay(CP.steerActuatorDelay)
     self.block_size = block_size
     self.block_count = block_count
     self.min_valid_block_count = min_valid_block_count

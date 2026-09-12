@@ -144,7 +144,7 @@ class Controls(ControlsExt):
     else:
       new_desired_curvature = model_v2.action.desiredCurvature if CC.latActive else self.curvature
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
-    lat_delay = self.sm["lateralDelay"].lateralDelay + LAT_SMOOTH_SECONDS
+    lat_delay = self.lat_delay + LAT_SMOOTH_SECONDS
 
     actuators.curvature = self.desired_curvature
     torque_feedback = {}
@@ -198,8 +198,10 @@ class Controls(ControlsExt):
       hudControl.leftLaneDepart = self.sm['driverAssistance'].leftLaneDeparture
       hudControl.rightLaneDepart = self.sm['driverAssistance'].rightLaneDeparture
 
-    # Match the c3x feedback gate, including its retained flag during MADS-only operation.
-    if self.sm['selfdriveState'].active:
+    # Lateral-only MADS needs the same applied-actuator feedback as full engagement.
+    # Drop stale mismatch state on inactivity or invalid/missing carOutput.
+    self.steer_limited_by_safety = False
+    if CC.latActive and self.sm.all_checks(['carOutput']):
       CO = self.sm['carOutput']
       if self.CP.steerControlType == car.CarParams.SteerControlType.angle:
         self.steer_limited_by_safety = abs(CC.actuators.steeringAngleDeg - CO.actuatorsOutput.steeringAngleDeg) > \

@@ -13,7 +13,7 @@ from opendbc.car import structs
 from openpilot.common.params import Params
 from openpilot.common.swaglog import cloudlog
 from openpilot.sunnypilot import PARAMS_UPDATE_PERIOD
-from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
+from openpilot.sunnypilot.livedelay.helpers import get_initial_lat_delay, get_lat_delay
 from openpilot.sunnypilot.modeld_v2.modeld_base import ModelStateBase
 from openpilot.sunnypilot.selfdrive.controls.lib.blinker_pause_lateral import BlinkerPauseLateral
 from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_v0 import LatControlTorque as LatControlTorqueV0
@@ -22,7 +22,7 @@ from openpilot.sunnypilot.selfdrive.controls.lib.latcontrol_torque_c3x import La
 
 class ControlsExt(ModelStateBase):
   def __init__(self, CP: structs.CarParams, params: Params):
-    ModelStateBase.__init__(self)
+    ModelStateBase.__init__(self, params, get_initial_lat_delay(CP.steerActuatorDelay))
     self.CP = CP
     self.params = params
     self._param_update_time: float = 0.0
@@ -53,7 +53,7 @@ class ControlsExt(ModelStateBase):
       self.blinker_pause_lateral.get_params()
 
       if self.CP.lateralTuning.which() == 'torque':
-        self.lat_delay = get_lat_delay(self.params, sm["lateralDelay"].lateralDelay)
+        self.lat_delay = get_lat_delay(self.params, sm["lateralDelay"].lateralDelay, get_initial_lat_delay(self.CP.steerActuatorDelay))
 
       self._param_update_time = time.monotonic()
 

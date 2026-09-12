@@ -29,9 +29,9 @@ def clip_curvature(v_ego, prev_curvature, new_curvature, roll) -> tuple[float, b
   # This function respects ISO lateral jerk and acceleration limits + a max curvature
   v_ego = max(v_ego, MIN_SPEED)
   max_curvature_rate = MAX_LATERAL_JERK / (v_ego ** 2)  # inexact calculation, check https://github.com/commaai/openpilot/pull/24755
-  new_curvature = np.clip(new_curvature,
-                          prev_curvature - max_curvature_rate * DT_CTRL,
-                          prev_curvature + max_curvature_rate * DT_CTRL)
+  new_curvature, limited_rate = clamp(new_curvature,
+                                       prev_curvature - max_curvature_rate * DT_CTRL,
+                                       prev_curvature + max_curvature_rate * DT_CTRL)
 
   roll_compensation = roll * ACCELERATION_DUE_TO_GRAVITY
   max_lat_accel = MAX_LATERAL_ACCEL_NO_ROLL + roll_compensation
@@ -39,7 +39,7 @@ def clip_curvature(v_ego, prev_curvature, new_curvature, roll) -> tuple[float, b
   new_curvature, limited_accel = clamp(new_curvature, min_lat_accel / v_ego ** 2, max_lat_accel / v_ego ** 2)
 
   new_curvature, limited_max_curv = clamp(new_curvature, -MAX_CURVATURE, MAX_CURVATURE)
-  return float(new_curvature), limited_accel or limited_max_curv
+  return float(new_curvature), limited_rate or limited_accel or limited_max_curv
 
 
 def get_accel_from_plan(speeds, accels, t_idxs, action_t=DT_MDL):

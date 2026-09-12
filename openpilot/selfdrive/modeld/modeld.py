@@ -33,10 +33,10 @@ from openpilot.common.hardware.usb import CHESTNUT_USB_IDS, chestnut_usb_identit
 from openpilot.selfdrive.modeld.constants import ModelConstants, Plan
 from openpilot.selfdrive.modeld.helpers import chestnut_compiled, modeld_pkl_path, load_oob
 from openpilot.system.hardware.chestnut.inference import RecoveringModel
-from openpilot.selfdrive.modeld.lane_centering_integration import LaneCenteringModelAdapter, update_lane_change_helpers
+from openpilot.selfdrive.modeld.lane_centering_integration import LaneCenteringModelAdapter, fill_lane_centering_status, update_lane_change_helpers
 from openpilot.selfdrive.modeld.lane_centering import ACTION_SMOOTH_SECONDS
 
-from openpilot.sunnypilot.livedelay.helpers import get_lat_delay
+from openpilot.sunnypilot.livedelay.helpers import get_initial_lat_delay, get_lat_delay
 from openpilot.sunnypilot.modeld_v2.modeld_base import ModelStateBase
 from openpilot.sunnypilot.selfdrive.controls.lib.relc import RoadEdgeLaneChangeController
 
@@ -306,6 +306,8 @@ def main(demo=False):
   else:
     CP = messaging.log_from_bytes(params.get("CarParams", block=True), car.CarParams)
   cloudlog.info("modeld got CarParams: %s", CP.brand)
+  fallback_lat_delay = get_initial_lat_delay(CP.steerActuatorDelay)
+  model.lat_delay = get_lat_delay(params, fallback_lat_delay, fallback_lat_delay)
 
   # TODO this needs more thought, use .2s extra for now to estimate other delays
   # TODO Move smooth seconds to action function
@@ -354,7 +356,7 @@ def main(demo=False):
     is_rhd = sm["driverMonitoringState"].isRHD
     frame_id = sm["narrowRoadCameraState"].frameId
     v_ego = max(sm["carState"].vEgo, 0.)
-    model.lat_delay = get_lat_delay(params, sm["lateralDelay"].lateralDelay)
+    model.lat_delay = get_lat_delay(params, sm["lateralDelay"].lateralDelay, fallback_lat_delay)
     lat_delay = model.lat_delay + ACTION_SMOOTH_SECONDS
     if sm.updated["extrinsicsCalibration"] and sm.seen['narrowRoadCameraState'] and sm.seen['deviceState']:
       device_from_calib_euler = np.array(sm["extrinsicsCalibration"].rpyCalib, dtype=np.float32)
@@ -408,7 +410,7 @@ def main(demo=False):
       mdv2sp_send = messaging.new_message('modelDataV2SP')
       update_lane_change_helpers(model_output, sm['carState'], sm['carControl'].latActive, v_ego,
                                  DH, RELC, mdv2sp_send.modelDataV2SP)
-      selected_model_output, action, _ = lane_centering.update(
+      selected_model_output, action, lane_status = lane_centering.update(
         model_output, get_action_from_model, sm, extrinsics_calibration_seen, DH.lane_change_state,
         meta_main.timestamp_eof, v_ego, lat_action_t, long_action_t,
       )
@@ -416,6 +418,7 @@ def main(demo=False):
                      publish_state, meta_main.frame_id, meta_extra.frame_id, frame_id,
                      frame_drop_ratio, meta_main.timestamp_eof, model_execution_time, extrinsics_calibration_seen)
       modelv2_send.modelV2.big = model.chestnut
+      fill_lane_centering_status(modelv2_send.modelV2, model_output, lane_status, lane_centering.controller.mode)
 
       modelv2_send.modelV2.meta.laneChangeState = DH.lane_change_state
       modelv2_send.modelV2.meta.laneChangeDirection = DH.lane_change_direction

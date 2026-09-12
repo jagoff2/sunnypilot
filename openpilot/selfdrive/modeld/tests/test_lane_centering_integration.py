@@ -2,6 +2,7 @@ import ast
 import copy
 import types
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -204,7 +205,8 @@ class TestLaneCenteringIntegration(unittest.TestCase):
               np.testing.assert_array_equal(left[0]['plan'], right[0]['plan'])
               self.assertEqual(left[1].desiredCurvature, right[1].desiredCurvature)
               self.assertEqual(adapters[0].previous_base_action.desiredCurvature, adapters[1].previous_base_action.desiredCurvature)
-              self.assertEqual(left[2], right[2])
+              # Telemetry records the ignored native action head faithfully.
+              self.assertEqual(replace(left[2], native_curvature=0.0), replace(right[2], native_curvature=0.0))
 
   def test_low_speed_holds_each_history_then_resumes_from_selected_plan(self):
     for name, native in native_actions():
@@ -246,10 +248,12 @@ class TestLaneCenteringIntegration(unittest.TestCase):
               output[head][0, :, Plan.T_FROM_CURRENT_EULER.start + 2] *= -2.0
               output[head][0, :, Plan.ORIENTATION_RATE.start + 2] *= -2.0
             expected_long = native(output, adapter.previous_base_action, 0.475, 0.475, 20.0)
-            selected, action, _ = self.run_frames(adapter, output, native, inputs)
+            selected, action, status = self.run_frames(adapter, output, native, inputs)
             self.assertIs(selected, output)
-            self.assertAlmostEqual(action.desiredCurvature, smooth_value(curvature, 0.0, ACTION_SMOOTH_SECONDS), places=8)
-            self.assertAlmostEqual(adapter.previous_base_action.desiredCurvature, action.desiredCurvature, places=8)
+            self.assertAlmostEqual(action.desiredCurvature, sign * 5.0 * DT_MDL / 400.0, places=8)
+            self.assertTrue(status.action_limited)
+            self.assertAlmostEqual(adapter.previous_base_action.desiredCurvature,
+                                   smooth_value(curvature, 0.0, ACTION_SMOOTH_SECONDS), places=8)
             self.assertEqual(action.desiredAcceleration, expected_long.desiredAcceleration)
             self.assertEqual(action.shouldStop, expected_long.shouldStop)
 
